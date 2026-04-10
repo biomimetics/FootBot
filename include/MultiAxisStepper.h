@@ -17,6 +17,8 @@ class MultiAxisStepper {
 
     void setSpeed(Axis axis, unsigned int speedMicroseconds);
     void setSpeeds(unsigned int speedX, unsigned int speedY, unsigned int speedZ);
+    void setPulseWidth(Axis axis, unsigned int pulseWidthMicroseconds);
+    void setPulseWidths(unsigned int pulseWidthX, unsigned int pulseWidthY, unsigned int pulseWidthZ);
 
     void moveBy(long xSteps, long ySteps, long zSteps);
     void moveTo(long xPosition, long yPosition, long zPosition);

@@ -32,6 +32,19 @@ void MultiAxisStepper::setSpeeds(unsigned int speedX, unsigned int speedY, unsig
   setSpeed(Z_AXIS, speedZ);
 }
 
+void MultiAxisStepper::setPulseWidth(Axis axis, unsigned int pulseWidthMicroseconds) {
+  if (axis < 0 || axis >= AXIS_COUNT) {
+    return;
+  }
+  _motors[axis]->setPulseWidth(pulseWidthMicroseconds);
+}
+
+void MultiAxisStepper::setPulseWidths(unsigned int pulseWidthX, unsigned int pulseWidthY, unsigned int pulseWidthZ) {
+  setPulseWidth(X_AXIS, pulseWidthX);
+  setPulseWidth(Y_AXIS, pulseWidthY);
+  setPulseWidth(Z_AXIS, pulseWidthZ);
+}
+
 // Public: begin a non-blocking relative move.
 void MultiAxisStepper::moveBy(long xSteps, long ySteps, long zSteps) {
   long steps[AXIS_COUNT] = { xSteps, ySteps, zSteps };

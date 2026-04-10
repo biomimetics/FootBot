@@ -63,25 +63,25 @@ pip install pyserial
 Open a serial port and send a query position command:
 
 ```bash
-python utils/StageCommandComms.py --port COM3 --baud 115200 --query-pos
+python scripts/StageCommandComms.py --port COM4 --baud 115200 --query-pos
 ```
 
 Send a relative move command:
 
 ```bash
-python utils/StageCommandComms.py --port COM3 --move-rel 1.0 0.0 -0.5
+python scripts/StageCommandComms.py --port COM4 --move-rel 1.0 0.0 -0.5
 ```
 
 Send a speed update:
 
 ```bash
-python utils/StageCommandComms.py --port COM3 --set-speed 2000 2000 2000
+python scripts/StageCommandComms.py --port COM4 --set-speed 2000 2000 2000
 ```
 
 Enter interactive mode:
 
 ```bash
-python utils/StageCommandComms.py --port COM3 --interactive
+python scripts/StageCommandComms.py --port COM4 --interactive
 ```
 
 ### Interactive mode commands

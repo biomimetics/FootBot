@@ -61,6 +61,14 @@ void StageController::setSpeeds(unsigned int speedX, unsigned int speedY, unsign
   _stepper.setSpeeds(speedX, speedY, speedZ);
 }
 
+void StageController::setPulseWidth(Axis axis, unsigned int pulseWidthMicroseconds) {
+  _stepper.setPulseWidth(static_cast<MultiAxisStepper::Axis>(axis), pulseWidthMicroseconds);
+}
+
+void StageController::setPulseWidths(unsigned int pulseWidthX, unsigned int pulseWidthY, unsigned int pulseWidthZ) {
+  _stepper.setPulseWidths(pulseWidthX, pulseWidthY, pulseWidthZ);
+}
+
 void StageController::update() {
   _stepper.update();
 }

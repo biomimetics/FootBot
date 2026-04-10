@@ -30,6 +30,10 @@ void setup()
   
   int initial_speed = 2000; // microseconds between steps (lower = faster)
   stage_controller.setSpeeds(initial_speed, initial_speed, initial_speed);
+
+  int initial_pulse_width = 2000; // microseconds
+  stage_controller.setPulseWidths(initial_pulse_width, initial_pulse_width, initial_pulse_width);
+
   serialComms.sendStatus("STARTING UP");
 }
 

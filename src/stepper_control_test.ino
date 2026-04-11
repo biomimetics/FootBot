@@ -16,7 +16,9 @@ MultiAxisStepper multi_axis_stepper(motor_x, motor_y, motor_z);
 
 // define helper object for directly controlling stage position
 StageController stage_controller(multi_axis_stepper, 
-                                 (float[AXIS_COUNT]){MOTOR_X_STEPS_PER_REV, MOTOR_Y_STEPS_PER_REV, MOTOR_Z_STEPS_PER_REV},
+                                 (float[AXIS_COUNT]){MOTOR_X_STEPS_PER_REV * MOTOR_X_MICROSTEP, 
+                                  MOTOR_Y_STEPS_PER_REV * MOTOR_Y_MICROSTEP, 
+                                  MOTOR_Z_STEPS_PER_REV * MOTOR_Z_MICROSTEP},
                                  (float[AXIS_COUNT]){MOTOR_X_MM_PER_REV, MOTOR_Y_MM_PER_REV, MOTOR_Z_MM_PER_REV});
 
 // define serial communication object
@@ -27,12 +29,9 @@ void setup()
   Serial.begin(BAUD_RATE);
   serialComms.begin();
 
-  
-  int initial_speed = 2000; // microseconds between steps (lower = faster)
-  stage_controller.setSpeeds(initial_speed, initial_speed, initial_speed);
+  stage_controller.setSpeeds(COMMON_SPEED, COMMON_SPEED, COMMON_SPEED);
 
-  int initial_pulse_width = 2000; // microseconds
-  stage_controller.setPulseWidths(initial_pulse_width, initial_pulse_width, initial_pulse_width);
+  stage_controller.setPulseWidths(COMMON_PULSE_WIDTH, COMMON_PULSE_WIDTH, COMMON_PULSE_WIDTH);
 
   serialComms.sendStatus("STARTING UP");
 }

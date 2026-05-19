@@ -5,11 +5,24 @@ Arduino via StageCommandComms, enables the axes, and sends relative
 move commands using user-defined X/Y and Z step sizes.
 """
 
+
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 from StageCommandComms import StageCommandComms
 
+# Force sensor plotting imports
+import threading
+import time
+import re
+from collections import deque
+try:
+    import serial
+except Exception:
+    serial = None
+
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 class StageControlGUI:
     def __init__(self, root):
@@ -30,6 +43,7 @@ class StageControlGUI:
         self._build_step_frame()
         self._build_control_frame()
         self._build_status_frame()
+        self._build_force_frame()
 
     def _build_connection_frame(self):
         conn = ttk.LabelFrame(self.main_frame, text="Connection")
@@ -125,6 +139,48 @@ class StageControlGUI:
         ttk.Label(pos_frame, text="Z:").grid(row=0, column=4, sticky="w", padx=4, pady=2)
         self.z_pos_label = ttk.Label(pos_frame, text="--", foreground="blue")
         self.z_pos_label.grid(row=0, column=5, sticky="w", padx=4, pady=2)
+
+    def _build_force_frame(self):
+        force = ttk.LabelFrame(self.main_frame, text="Force Sensor")
+        force.grid(row=4, column=0, sticky="nsew", padx=2, pady=2)
+        force.columnconfigure(1, weight=1)
+
+        # Connection controls for force sensor
+        ttk.Label(force, text="Port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.force_port_entry = ttk.Entry(force)
+        self.force_port_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        self.force_port_entry.insert(0, "/dev/ttyACM1")
+
+        ttk.Label(force, text="Baud:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
+        self.force_baud_entry = ttk.Entry(force, width=8)
+        self.force_baud_entry.grid(row=0, column=3, sticky="w", padx=4, pady=4)
+        self.force_baud_entry.insert(0, "115200")
+
+        self.force_connect_button = ttk.Button(force, text="Connect Force", command=self.toggle_force)
+        self.force_connect_button.grid(row=0, column=4, sticky="e", padx=4, pady=4)
+
+        # Matplotlib figure for force over time
+        self.force_fig = Figure(figsize=(6,2.0), dpi=100)
+        self.force_ax = self.force_fig.add_subplot(111)
+        self.force_ax.set_title('Force (units)')
+        self.force_ax.set_ylabel('Force')
+        self.force_ax.set_xlabel('Time (s)')
+        self.force_line, = self.force_ax.plot([], [], '-b')
+        # Fixed Y axis range: top 100, bottom -1000 grams
+        self.force_ax.set_ylim(-1000, 100)
+        self.force_canvas = FigureCanvasTkAgg(self.force_fig, master=force)
+        self.force_canvas.get_tk_widget().grid(row=1, column=0, columnspan=5, sticky='nsew')
+
+        # Data buffer: store (t, value) pairs with 10s horizon
+        self._force_lock = threading.Lock()
+        self._force_data = deque()
+        self._force_window_s = 10.0
+        self._force_serial = None
+        self._force_thread = None
+        self._force_running = False
+        self._force_line_re = re.compile(r"<FORCE,\s*([+-]?\d*\.?\d+)>")
+        # schedule plot updates
+        self._schedule_force_plot()
 
     def _set_status(self, message, color="black"):
         self.status_label.config(text=message, foreground=color)
@@ -223,6 +279,12 @@ class StageControlGUI:
         self._update_connection_state(False)
         self._set_status("Disconnected", color="red")
         self._update_positions()  # Reset positions to --
+        # also stop force connection if any
+        if getattr(self, '_force_running', False):
+            try:
+                self._stop_force()
+            except Exception:
+                pass
 
     def _parse_step(self, axis):
         raw = self.xy_step_entry.get().strip() if axis in {"X", "Y"} else self.z_step_entry.get().strip()
@@ -279,6 +341,94 @@ class StageControlGUI:
         except Exception as exc:
             self._set_status(f"Command failed: {exc}", color="red")
             messagebox.showerror("Command failed", str(exc))
+
+    # ---- Force sensor handling ----
+    def toggle_force(self):
+        if getattr(self, '_force_running', False):
+            self._stop_force()
+        else:
+            self._start_force()
+
+    def _start_force(self):
+        if serial is None:
+            messagebox.showerror("Missing dependency", "pyserial is required for force sensor support")
+            return
+        port = self.force_port_entry.get().strip()
+        try:
+            baud = int(self.force_baud_entry.get().strip())
+        except ValueError:
+            messagebox.showwarning("Invalid baud", "Baud rate must be a whole number.")
+            return
+        try:
+            self._force_serial = serial.Serial(port, baud, timeout=1.0)
+        except Exception as exc:
+            messagebox.showerror("Open failed", str(exc))
+            return
+        self._force_running = True
+        self.force_connect_button.config(text="Disconnect Force")
+        self._force_thread = threading.Thread(target=self._force_reader_loop, daemon=True)
+        self._force_thread.start()
+
+    def _stop_force(self):
+        self._force_running = False
+        if self._force_thread is not None:
+            self._force_thread.join(timeout=1.0)
+        try:
+            if self._force_serial is not None:
+                self._force_serial.close()
+        except Exception:
+            pass
+        self._force_serial = None
+        self._force_thread = None
+        self.force_connect_button.config(text="Connect Force")
+
+    def _force_reader_loop(self):
+        while getattr(self, '_force_running', False) and self._force_serial is not None:
+            try:
+                line = self._force_serial.readline().decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+                m = self._force_line_re.search(line)
+                if m:
+                    try:
+                        val = float(m.group(1))
+                    except Exception:
+                        continue
+                    now = time.time()
+                    with self._force_lock:
+                        self._force_data.append((now, val))
+                        cutoff = now - self._force_window_s
+                        while self._force_data and self._force_data[0][0] < cutoff:
+                            self._force_data.popleft()
+                # ignore other lines
+            except Exception:
+                time.sleep(0.01)
+
+    def _schedule_force_plot(self):
+        self.root.after(250, self._schedule_force_plot)
+        # update plot
+        with self._force_lock:
+            if not self._force_data:
+                xs, ys = [], []
+            else:
+                now = time.time()
+                xs = [t - now for (t, v) in self._force_data]
+                ys = [v for (t, v) in self._force_data]
+        # plot with time axis from -window..0
+        # Always use fixed Y limits: top 100, bottom -1000 grams
+        if xs:
+            self.force_line.set_xdata(xs)
+            self.force_line.set_ydata(ys)
+            self.force_ax.set_xlim(-self._force_window_s, 0)
+        else:
+            self.force_line.set_xdata([])
+            self.force_line.set_ydata([])
+            self.force_ax.set_xlim(-self._force_window_s, 0)
+        self.force_ax.set_ylim(-1000, 100)
+        try:
+            self.force_canvas.draw_idle()
+        except Exception:
+            pass
 
 
 def main():

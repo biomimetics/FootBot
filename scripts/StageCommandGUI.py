@@ -158,16 +158,17 @@ class StageControlGUI:
 
         self.force_connect_button = ttk.Button(force, text="Connect Force", command=self.toggle_force)
         self.force_connect_button.grid(row=0, column=4, sticky="e", padx=4, pady=4)
+        self.force_calib_button = ttk.Button(force, text="Calibrate", command=self._force_calibrate)
+        self.force_calib_button.grid(row=0, column=5, sticky="e", padx=4, pady=4)
 
         # Matplotlib figure for force over time
         self.force_fig = Figure(figsize=(6,2.0), dpi=100)
         self.force_ax = self.force_fig.add_subplot(111)
-        self.force_ax.set_title('Force (units)')
+        self.force_ax.set_title('Force (g)')
         self.force_ax.set_ylabel('Force')
         self.force_ax.set_xlabel('Time (s)')
         self.force_line, = self.force_ax.plot([], [], '-b')
-        # Fixed Y axis range: top 100, bottom -1000 grams
-        self.force_ax.set_ylim(-1000, 100)
+        self.force_ax.set_ylim(-100, 1000)
         self.force_canvas = FigureCanvasTkAgg(self.force_fig, master=force)
         self.force_canvas.get_tk_widget().grid(row=1, column=0, columnspan=5, sticky='nsew')
 
@@ -175,6 +176,8 @@ class StageControlGUI:
         self._force_lock = threading.Lock()
         self._force_data = deque()
         self._force_window_s = 10.0
+        # Lock to provide exclusive access to the force serial port
+        self._force_serial_lock = threading.Lock()
         self._force_serial = None
         self._force_thread = None
         self._force_running = False
@@ -368,6 +371,7 @@ class StageControlGUI:
         self.force_connect_button.config(text="Disconnect Force")
         self._force_thread = threading.Thread(target=self._force_reader_loop, daemon=True)
         self._force_thread.start()
+        self.force_calib_button.config(state="normal")
 
     def _stop_force(self):
         self._force_running = False
@@ -381,11 +385,21 @@ class StageControlGUI:
         self._force_serial = None
         self._force_thread = None
         self.force_connect_button.config(text="Connect Force")
+        self.force_calib_button.config(state="disabled")
 
     def _force_reader_loop(self):
         while getattr(self, '_force_running', False) and self._force_serial is not None:
+            # Try to acquire serial lock briefly; if an exclusive operation
+            # (calibration) holds the lock, skip this read to avoid stealing responses.
+            got = self._force_serial_lock.acquire(timeout=0.1)
+            if not got:
+                time.sleep(0.01)
+                continue
             try:
-                line = self._force_serial.readline().decode('utf-8', errors='ignore').strip()
+                try:
+                    line = self._force_serial.readline().decode('utf-8', errors='ignore').strip()
+                except Exception:
+                    line = ''
                 if not line:
                     continue
                 m = self._force_line_re.search(line)
@@ -401,8 +415,11 @@ class StageControlGUI:
                         while self._force_data and self._force_data[0][0] < cutoff:
                             self._force_data.popleft()
                 # ignore other lines
-            except Exception:
-                time.sleep(0.01)
+            finally:
+                try:
+                    self._force_serial_lock.release()
+                except Exception:
+                    pass
 
     def _schedule_force_plot(self):
         self.root.after(250, self._schedule_force_plot)
@@ -420,15 +437,153 @@ class StageControlGUI:
             self.force_line.set_xdata(xs)
             self.force_line.set_ydata(ys)
             self.force_ax.set_xlim(-self._force_window_s, 0)
+            self.force_ax.set_title('Current Force: {:.1f} g'.format(ys[-1]))
+
         else:
             self.force_line.set_xdata([])
             self.force_line.set_ydata([])
             self.force_ax.set_xlim(-self._force_window_s, 0)
-        self.force_ax.set_ylim(-1000, 100)
+        self.force_ax.set_ylim(-100, 1000)
         try:
             self.force_canvas.draw_idle()
         except Exception:
             pass
+
+    def _read_force_response(self, timeout=5.0):
+        """Read lines from force serial until a framed <...> line is returned or timeout."""
+        if self._force_serial is None:
+            return None
+        # Acquire exclusive access to the serial port for this response read
+        acquired = self._force_serial_lock.acquire(timeout=timeout)
+        if not acquired:
+            return None
+        try:
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    line = self._force_serial.readline().decode('utf-8', errors='ignore').strip()
+                except Exception:
+                    line = ''
+                if not line:
+                    continue
+                if line.startswith('<') and line.endswith('>'):
+                    return line
+            return None
+        finally:
+            try:
+                self._force_serial_lock.release()
+            except Exception:
+                pass
+
+    def _send_force_and_wait(self, cmd, wait_prefix=None, timeout=5.0):
+        if self._force_serial is None:
+            return None
+        try:
+            self._force_serial.write((cmd + '\n').encode('utf-8'))
+            self._force_serial.flush()
+        except Exception:
+            return None
+        if wait_prefix is None:
+            return None
+        # Hold exclusive access to serial for command-response sequence
+        acquired = self._force_serial_lock.acquire(timeout=timeout)
+        if not acquired:
+            return None
+        try:
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    resp = self._force_serial.readline().decode('utf-8', errors='ignore').strip()
+                except Exception:
+                    resp = ''
+                if not resp:
+                    continue
+                if resp.startswith(f"<{wait_prefix}"):
+                    return resp
+            return None
+        finally:
+            try:
+                self._force_serial_lock.release()
+            except Exception:
+                pass
+
+    def _force_calibrate(self):
+        if self._force_serial is None:
+            messagebox.showwarning("Not connected", "Connect to the force sensor first.")
+            return
+        # Start calibration
+        self._send_force_and_wait('CALIBRATE', wait_prefix='STATUS', timeout=2.0)
+        # Prompt user to remove load
+        if not messagebox.askokcancel('Calibration', 'Remove all load from the sensor, then press OK to confirm zero.'):
+            return
+        # confirm zero
+        zero_resp = self._send_force_and_wait('CONFIRM_ZERO', wait_prefix='STATUS,ZERO_DONE', timeout=10.0)
+        if zero_resp is None:
+            messagebox.showerror('Calibration', 'Zeroing failed or timed out.')
+            return
+        # parse offset
+        m = re.search(r"<STATUS,ZERO_DONE,\s*([+-]?\d+)>", zero_resp)
+        offset = None
+        if m:
+            offset = int(m.group(1))
+
+        # Inform user and present a non-modal dialog so they can move the stage
+        msg = ('Zero recorded. Please apply a known weight and position the stage as needed. When ready, enter the weight (grams) below and click Apply Weight.')
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Calibration - Apply Weight')
+        dlg.geometry('360x120')
+        ttk.Label(dlg, text=msg, wraplength=340).pack(padx=8, pady=6)
+        entry_frame = ttk.Frame(dlg)
+        entry_frame.pack(fill='x', padx=8, pady=4)
+        ttk.Label(entry_frame, text='Weight (g):').grid(row=0, column=0, sticky='w')
+        weight_entry = ttk.Entry(entry_frame)
+        weight_entry.grid(row=0, column=1, sticky='ew', padx=6)
+        entry_frame.columnconfigure(1, weight=1)
+
+        def on_apply():
+            val = weight_entry.get().strip()
+            try:
+                w = float(val)
+            except Exception:
+                messagebox.showerror('Calibration', 'Invalid weight entered.')
+                return
+            dlg.destroy()
+            # perform SET_WEIGHT and continue flow
+            setresp = self._send_force_and_wait(f'SET_WEIGHT,{w}', wait_prefix='STATUS,CAL_COMPLETE', timeout=10.0)
+            if setresp is None:
+                messagebox.showerror('Calibration', 'Calibration step failed or timed out.')
+                return
+            m2 = re.search(r"<STATUS,CAL_COMPLETE,\s*([+-]?\d+),\s*([0-9.+-eE]+)>", setresp)
+            scale_val = None
+            if m2:
+                try:
+                    offset = int(m2.group(1))
+                except Exception:
+                    offset = None
+                try:
+                    scale_val = float(m2.group(2))
+                except Exception:
+                    scale_val = None
+            message = f'Calibration complete. Offset={offset}, Scale={scale_val:.6f}' if scale_val is not None else 'Calibration complete.'
+            if messagebox.askyesno('Calibration', message + '\n\nSave calibration to device EEPROM?'):
+                self._send_force_and_wait('SAVE_CAL', wait_prefix='STATUS,CAL_SAVED', timeout=3.0)
+                messagebox.showinfo('Calibration', 'Calibration saved.')
+            else:
+                messagebox.showinfo('Calibration', 'Calibration not saved.')
+
+        def on_cancel():
+            dlg.destroy()
+            messagebox.showinfo('Calibration', 'Calibration cancelled.')
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill='x', padx=8, pady=6)
+        apply_btn = ttk.Button(btn_frame, text='Apply Weight', command=on_apply)
+        apply_btn.pack(side='right', padx=6)
+        cancel_btn = ttk.Button(btn_frame, text='Cancel', command=on_cancel)
+        cancel_btn.pack(side='right')
+        # Allow user to interact with main window while this dialog is open
+        dlg.transient(self.root)
+        dlg.grab_release()
 
 
 def main():

@@ -2,7 +2,7 @@
 * Header file that contains pin definitions and constants for the stepper motor controller
 */
 
-#define BAUD_RATE 19200
+#define BAUD_RATE 115200
 
 #define AXIS_COUNT 3
 #define COMMON_SPEED 500 // microseconds between steps (lower = faster)

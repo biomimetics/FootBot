@@ -1,87 +1,231 @@
-"""Basic stage control GUI for Arduino-based X/Y/Z stages.
+"""Stage control GUI for Arduino-based X/Y/Z stages.
 
-This module provides a simple Tkinter interface that connects to the
-Arduino via StageCommandComms, enables the axes, and sends relative
-move commands using user-defined X/Y and Z step sizes.
+Provides a Tkinter desktop window that lets you:
+  - Connect to the stage Arduino over USB serial
+  - Move the X, Y, and Z axes by a configurable step size
+  - Set the movement speed of each axis independently
+  - Enable, disable, and stop the stepper motors
+  - Connect to a separate force-sensor Arduino and view a live force graph
+  - Run a two-point force calibration sequence
+  - Connect to a Trill flex touch-sensor Arduino and view a live bar chart
+
+Hardware setup
+--------------
+Stage Arduino  → typically /dev/ttyACM0  (Linux) or COM3 (Windows)
+Force Arduino  → typically /dev/ttyACM1  (Linux) or COM4 (Windows)
+Touch Arduino  → typically /dev/ttyACM2  (Linux) or COM5 (Windows)
+
+How to run
+----------
+    python StageCommandGUI.py
 """
-
 
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from StageCommandComms import StageCommandComms
-
-# Force sensor plotting imports
 import threading
 import time
 import re
 from collections import deque
+
 try:
     import serial
-except Exception:
-    serial = None
+except ImportError:
+    serial = None  # force-sensor features will be disabled if pyserial is missing
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
+from StageCommandComms import StageCommandComms
+
+
+# ---------------------------------------------------------------------------
+# Default settings — edit these to match your hardware before launching
+# ---------------------------------------------------------------------------
+DEFAULT_STAGE_PORT    = "/dev/ttyACM0"   # serial port for the stage Arduino
+DEFAULT_FORCE_PORT    = "/dev/ttyACM1"   # serial port for the force-sensor Arduino
+DEFAULT_BAUD          = 115200           # baud rate used by both Arduinos
+DEFAULT_XY_STEP_MM    = 1.0             # default X/Y movement per button press (mm)
+DEFAULT_Z_STEP_MM     = 0.5             # default Z movement per button press (mm)
+DEFAULT_XY_SPEED_MM_S = 2.0            # default X/Y speed (mm/s)
+DEFAULT_Z_SPEED_MM_S  = 0.4            # default Z speed (mm/s)
+
+DEFAULT_TOUCH_PORT    = "/dev/ttyACM2"   # serial port for the Trill touch sensor Arduino
+DEFAULT_FORCE_Y_MAX   = 1000            # default upper Y limit on the force graph (grams)
+DEFAULT_TOUCH_Y_MAX   = 400             # default upper Y limit on the touch bar chart (raw units)
+
+FORCE_WINDOW_S     = 10.0    # how many seconds of force history to show in the graph
+FORCE_PLOT_MS      = 250     # how often to redraw the force graph (milliseconds)
+POSITION_UPDATE_MS = 2000    # how often to poll the stage position (milliseconds)
+
+TOUCH_PLOT_MS = 100          # how often to redraw the touch bar chart (milliseconds)
+
+# ---------------------------------------------------------------------------
+# Motor physical constants — from firmware_stepper/include/common_constants.h
+# ---------------------------------------------------------------------------
+# All three axes use the same motor and microstepping setting.
+_STEPS_PER_REV = 200   # full steps per motor revolution
+_MICROSTEPS    = 16    # microstepping divisor set on the driver board
+
+# Lead-screw pitch differs between axes.
+_XY_MM_PER_REV = 6.35  # X and Y lead screws: 1/4-inch pitch
+_Z_MM_PER_REV  = 1.27  # Z lead screw: finer pitch for better resolution
+
+# Steps per mm — derived from the motor and lead-screw constants above.
+XY_STEPS_PER_MM = (_STEPS_PER_REV * _MICROSTEPS) / _XY_MM_PER_REV  # ≈ 503.9 steps/mm
+Z_STEPS_PER_MM  = (_STEPS_PER_REV * _MICROSTEPS) / _Z_MM_PER_REV   # ≈ 2519.7 steps/mm
+
+
+def mm_per_s_to_us_per_step(mm_per_s, steps_per_mm):
+    """Convert a speed in mm/s to the µs/step value the firmware expects.
+
+    The firmware schedules each step as:
+        next_step_time = now + speed_us * 2   (µs)
+    so:
+        step_freq (steps/s) = 1,000,000 / (speed_us * 2)
+        velocity  (mm/s)    = step_freq / steps_per_mm
+                            = 500,000  / (speed_us * steps_per_mm)
+    Rearranging:
+        speed_us = 500,000 / (mm_per_s * steps_per_mm)
+    """
+    return max(1, round(500_000 / (mm_per_s * steps_per_mm)))
+
+
+# ---------------------------------------------------------------------------
+# Main GUI class
+# ---------------------------------------------------------------------------
+
 class StageControlGUI:
+    """Main application window for controlling the XYZ stage."""
+
     def __init__(self, root):
         self.root = root
         self.root.title("Stage Control")
+
+        # comms object is created on connect and set to None when disconnected
         self.comms = None
 
+        # list of axis movement buttons — used to enable/disable them as a group
+        self._motion_buttons = []
+
         self._build_widgets()
-        self._update_connection_state(False)
+        self._update_connection_state(connected=False)
+
+    # =========================================================================
+    # GUI SETUP
+    # =========================================================================
 
     def _build_widgets(self):
+        """Create a two-column layout and call each section builder.
+
+        Left column  — all stage controls (connection, step size, speed, motion, status)
+        Right column — sensor plots stacked vertically (force on top, touch on bottom)
+        """
         self.main_frame = ttk.Frame(self.root, padding=12)
         self.main_frame.grid(sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
+        # Left panel: stage controls sit in column 0 (natural/fixed width)
+        self.left_panel = ttk.Frame(self.main_frame)
+        self.left_panel.grid(row=0, column=0, sticky="ns", padx=(0, 8))
+
+        # Right panel: sensor plots sit in column 1 (expands to fill remaining width)
+        self.right_panel = ttk.Frame(self.main_frame)
+        self.right_panel.grid(row=0, column=1, sticky="nsew")
+        self.right_panel.rowconfigure(0, weight=1)  # force frame grows
+        self.right_panel.rowconfigure(1, weight=1)  # touch frame grows
+
+        self.main_frame.columnconfigure(0, weight=0)  # left: don't stretch
+        self.main_frame.columnconfigure(1, weight=1)  # right: take all extra space
+        self.main_frame.rowconfigure(0, weight=1)
+
+        # Build left-column frames (rows 0-4 inside left_panel)
         self._build_connection_frame()
         self._build_step_frame()
+        self._build_speed_frame()
         self._build_control_frame()
         self._build_status_frame()
+
+        # Build right-column sensor frames (rows 0-1 inside right_panel)
         self._build_force_frame()
+        self._build_touch_frame()
 
     def _build_connection_frame(self):
-        conn = ttk.LabelFrame(self.main_frame, text="Connection")
+        """Left panel row 0 — serial port settings and the Connect/Disconnect button."""
+        conn = ttk.LabelFrame(self.left_panel, text="Connection")
         conn.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
         conn.columnconfigure(1, weight=1)
 
         ttk.Label(conn, text="Port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.port_entry = ttk.Entry(conn)
+        self.port_entry.insert(0, DEFAULT_STAGE_PORT)
         self.port_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
-        self.port_entry.insert(0, "/dev/ttyACM0")
 
         ttk.Label(conn, text="Baud:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
         self.baud_entry = ttk.Entry(conn, width=10)
+        self.baud_entry.insert(0, str(DEFAULT_BAUD))
         self.baud_entry.grid(row=0, column=3, sticky="w", padx=4, pady=4)
-        self.baud_entry.insert(0, "115200")
 
         self.connect_button = ttk.Button(conn, text="Connect", command=self.connect)
         self.connect_button.grid(row=0, column=4, sticky="e", padx=4, pady=4)
 
     def _build_step_frame(self):
-        step = ttk.LabelFrame(self.main_frame, text="Step sizes (mm)")
+        """Left panel row 1 — entry boxes for X/Y and Z step sizes."""
+        step = ttk.LabelFrame(self.left_panel, text="Step sizes (mm)")
         step.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
         step.columnconfigure(1, weight=1)
         step.columnconfigure(3, weight=1)
 
         ttk.Label(step, text="X/Y step:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.xy_step_entry = ttk.Entry(step)
+        self.xy_step_entry.insert(0, str(DEFAULT_XY_STEP_MM))
         self.xy_step_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
-        self.xy_step_entry.insert(0, "1.0")
 
         ttk.Label(step, text="Z step:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
         self.z_step_entry = ttk.Entry(step)
+        self.z_step_entry.insert(0, str(DEFAULT_Z_STEP_MM))
         self.z_step_entry.grid(row=0, column=3, sticky="ew", padx=4, pady=4)
-        self.z_step_entry.insert(0, "0.5")
+
+    def _build_speed_frame(self):
+        """Row 2 — per-axis speed entry boxes and a Set Speed button.
+
+        Speeds are entered in mm/s. The conversion to µs/step (required by the
+        firmware) is done automatically inside set_speed() using the motor's
+        physical constants (steps/mm and the firmware timing formula).
+
+        X and Y share the same lead screw pitch so their steps/mm are identical.
+        Z has a finer pitch and therefore a different steps/mm value — the same
+        mm/s value will result in a different µs/step number for Z.
+        """
+        speed = ttk.LabelFrame(self.left_panel, text="Speed (mm/s)")
+        speed.grid(row=2, column=0, sticky="ew", padx=2, pady=2)
+        speed.columnconfigure(1, weight=1)
+        speed.columnconfigure(3, weight=1)
+        speed.columnconfigure(5, weight=1)
+
+        ttk.Label(speed, text="X:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.x_speed_entry = ttk.Entry(speed)
+        self.x_speed_entry.insert(0, str(DEFAULT_XY_SPEED_MM_S))
+        self.x_speed_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(speed, text="Y:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
+        self.y_speed_entry = ttk.Entry(speed)
+        self.y_speed_entry.insert(0, str(DEFAULT_XY_SPEED_MM_S))
+        self.y_speed_entry.grid(row=0, column=3, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(speed, text="Z:").grid(row=0, column=4, sticky="w", padx=4, pady=4)
+        self.z_speed_entry = ttk.Entry(speed)
+        self.z_speed_entry.insert(0, str(DEFAULT_Z_SPEED_MM_S))
+        self.z_speed_entry.grid(row=0, column=5, sticky="ew", padx=4, pady=4)
+
+        self.set_speed_button = ttk.Button(speed, text="Set Speed", command=self.set_speed)
+        self.set_speed_button.grid(row=0, column=6, sticky="e", padx=4, pady=4)
 
     def _build_control_frame(self):
-        control = ttk.LabelFrame(self.main_frame, text="Motion controls")
-        control.grid(row=2, column=0, sticky="nsew", padx=2, pady=2)
+        """Left panel row 3 — +/- buttons for each axis plus Enable / Disable / Stop."""
+        control = ttk.LabelFrame(self.left_panel, text="Motion controls")
+        control.grid(row=3, column=0, sticky="nsew", padx=2, pady=2)
         control.columnconfigure(0, weight=1)
         control.columnconfigure(1, weight=1)
         control.columnconfigure(2, weight=1)
@@ -93,35 +237,44 @@ class StageControlGUI:
         self._add_axis_buttons(axis_frame, "Y", row=1)
         self._add_axis_buttons(axis_frame, "Z", row=2)
 
-        self.enable_button = ttk.Button(control, text="Enable Motion", command=self.enable_motion)
-        self.enable_button.grid(row=1, column=0, sticky="ew", padx=4, pady=6)
-
+        self.enable_button = ttk.Button(control, text="Enable Motion",  command=self.enable_motion)
         self.disable_button = ttk.Button(control, text="Disable Motion", command=self.disable_motion)
-        self.disable_button.grid(row=1, column=1, sticky="ew", padx=4, pady=6)
+        self.stop_button   = ttk.Button(control, text="Stop",           command=self.stop_motion)
 
-        self.stop_button = ttk.Button(control, text="Stop", command=self.stop_motion)
-        self.stop_button.grid(row=1, column=2, sticky="ew", padx=4, pady=6)
+        self.enable_button.grid( row=1, column=0, sticky="ew", padx=4, pady=6)
+        self.disable_button.grid(row=1, column=1, sticky="ew", padx=4, pady=6)
+        self.stop_button.grid(   row=1, column=2, sticky="ew", padx=4, pady=6)
 
     def _add_axis_buttons(self, parent, axis_name, row):
-        label = ttk.Label(parent, text=f"{axis_name}:")
-        label.grid(row=row, column=0, sticky="w", padx=4, pady=4)
+        """Add a label and +/- pair of buttons for one axis to *parent*."""
+        ttk.Label(parent, text=f"{axis_name}:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
 
-        minus = ttk.Button(parent, text=f"-{axis_name}", command=lambda a=axis_name: self.move_axis(a, negative=True))
-        minus.grid(row=row, column=1, sticky="ew", padx=4, pady=4)
+        minus_btn = ttk.Button(
+            parent, text=f"-{axis_name}",
+            command=lambda a=axis_name: self.move_axis(a, negative=True),
+        )
+        plus_btn = ttk.Button(
+            parent, text=f"+{axis_name}",
+            command=lambda a=axis_name: self.move_axis(a, negative=False),
+        )
 
-        plus = ttk.Button(parent, text=f"+{axis_name}", command=lambda a=axis_name: self.move_axis(a, negative=False))
-        plus.grid(row=row, column=2, sticky="ew", padx=4, pady=4)
+        minus_btn.grid(row=row, column=1, sticky="ew", padx=4, pady=4)
+        plus_btn.grid( row=row, column=2, sticky="ew", padx=4, pady=4)
+
+        # Keep a flat list of all axis buttons so we can enable/disable them
+        # together without searching the widget tree.
+        self._motion_buttons.extend([minus_btn, plus_btn])
 
     def _build_status_frame(self):
-        status = ttk.Frame(self.main_frame)
-        status.grid(row=3, column=0, sticky="ew", padx=2, pady=2)
+        """Left panel row 4 — connection status text and X/Y/Z position labels."""
+        status = ttk.Frame(self.left_panel)
+        status.grid(row=4, column=0, sticky="ew", padx=2, pady=2)
         status.columnconfigure(1, weight=1)
 
         ttk.Label(status, text="Status:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.status_label = ttk.Label(status, text="Disconnected", foreground="red")
         self.status_label.grid(row=0, column=1, sticky="w", padx=4, pady=4)
 
-        # Position display
         pos_frame = ttk.LabelFrame(status, text="Current Positions (mm)")
         pos_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
         pos_frame.columnconfigure(1, weight=1)
@@ -141,55 +294,270 @@ class StageControlGUI:
         self.z_pos_label.grid(row=0, column=5, sticky="w", padx=4, pady=2)
 
     def _build_force_frame(self):
-        force = ttk.LabelFrame(self.main_frame, text="Force Sensor")
-        force.grid(row=4, column=0, sticky="nsew", padx=2, pady=2)
-        force.columnconfigure(1, weight=1)
+        """Right panel row 0 — force-sensor connection, live line graph, and calibration."""
+        force = ttk.LabelFrame(self.right_panel, text="Force Sensor")
+        force.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        force.columnconfigure(1, weight=1)  # port entry expands
+        force.rowconfigure(1, weight=1)     # graph row expands
 
-        # Connection controls for force sensor
+        # --- Serial port controls ---
         ttk.Label(force, text="Port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.force_port_entry = ttk.Entry(force)
+        self.force_port_entry.insert(0, DEFAULT_FORCE_PORT)
         self.force_port_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
-        self.force_port_entry.insert(0, "/dev/ttyACM1")
 
         ttk.Label(force, text="Baud:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
         self.force_baud_entry = ttk.Entry(force, width=8)
+        self.force_baud_entry.insert(0, str(DEFAULT_BAUD))
         self.force_baud_entry.grid(row=0, column=3, sticky="w", padx=4, pady=4)
-        self.force_baud_entry.insert(0, "115200")
 
         self.force_connect_button = ttk.Button(force, text="Connect Force", command=self.toggle_force)
         self.force_connect_button.grid(row=0, column=4, sticky="e", padx=4, pady=4)
+
         self.force_calib_button = ttk.Button(force, text="Calibrate", command=self._force_calibrate)
         self.force_calib_button.grid(row=0, column=5, sticky="e", padx=4, pady=4)
 
-        # Matplotlib figure for force over time
-        self.force_fig = Figure(figsize=(6,2.0), dpi=100)
-        self.force_ax = self.force_fig.add_subplot(111)
-        self.force_ax.set_title('Force (g)')
-        self.force_ax.set_ylabel('Force')
-        self.force_ax.set_xlabel('Time (s)')
-        self.force_line, = self.force_ax.plot([], [], '-b')
-        self.force_ax.set_ylim(-100, 1000)
-        self.force_canvas = FigureCanvasTkAgg(self.force_fig, master=force)
-        self.force_canvas.get_tk_widget().grid(row=1, column=0, columnspan=5, sticky='nsew')
+        # Y-axis max — user can type a new value; the plot picks it up on the next redraw
+        ttk.Label(force, text="Y max (g):").grid(row=0, column=6, sticky="w", padx=(8, 2), pady=4)
+        self.force_y_max_entry = ttk.Entry(force, width=6)
+        self.force_y_max_entry.insert(0, str(DEFAULT_FORCE_Y_MAX))
+        self.force_y_max_entry.grid(row=0, column=7, sticky="w", padx=(0, 4), pady=4)
 
-        # Data buffer: store (t, value) pairs with 10s horizon
-        self._force_lock = threading.Lock()
-        self._force_data = deque()
-        self._force_window_s = 10.0
-        # Lock to provide exclusive access to the force serial port
-        self._force_serial_lock = threading.Lock()
-        self._force_serial = None
-        self._force_thread = None
-        self._force_running = False
-        self._force_line_re = re.compile(r"<FORCE,\s*([+-]?\d*\.?\d+)>")
-        # schedule plot updates
+        # --- Matplotlib line graph ---
+        self.force_fig = Figure(figsize=(6, 2.5), dpi=100)
+        self.force_ax  = self.force_fig.add_subplot(111)
+        self.force_ax.set_title("Force (g)")
+        self.force_ax.set_ylabel("Force (g)")
+        self.force_ax.set_xlabel("Time (s)")
+        self.force_line, = self.force_ax.plot([], [], "-b")
+
+        self.force_canvas = FigureCanvasTkAgg(self.force_fig, master=force)
+        self.force_canvas.get_tk_widget().grid(row=1, column=0, columnspan=8, sticky="nsew")
+
+        # --- Internal state for the force-sensor thread ---
+        # The reader thread runs in the background and fills _force_data.
+        # _force_lock protects _force_data from simultaneous access by the
+        # reader thread and the main (GUI) thread.
+        # _force_serial_lock gives the calibration commands exclusive use of
+        # the serial port so they don't race with the normal reader loop.
+        self._force_data       = deque()          # list of (timestamp, grams) tuples
+        self._force_lock       = threading.Lock() # guards _force_data
+        self._force_serial_lock = threading.Lock() # guards _force_serial during calibration
+
+        self._force_serial  = None   # serial.Serial object when connected
+        self._force_thread  = None   # background reader thread
+        self._force_running = False  # set to False to stop the reader thread
+
+        # Regex that matches the Arduino's <FORCE,123.45> output lines
+        self._force_regex = re.compile(r"<FORCE,\s*([+-]?\d*\.?\d+)>")
+
+        # Start the periodic graph redraw (runs even when no sensor is connected)
         self._schedule_force_plot()
 
+    # =========================================================================
+    # CONNECTION MANAGEMENT
+    # =========================================================================
+
     def _set_status(self, message, color="black"):
+        """Update the status label text and colour."""
         self.status_label.config(text=message, foreground=color)
 
+    def _update_connection_state(self, connected):
+        """Enable or disable controls that require an active stage connection."""
+        state = "normal" if connected else "disabled"
+
+        # Enable/disable the Enable, Disable, Stop, and Set Speed buttons
+        self.enable_button.config(state=state)
+        self.disable_button.config(state=state)
+        self.stop_button.config(state=state)
+        self.set_speed_button.config(state=state)
+
+        # Enable/disable all six axis movement buttons
+        for btn in self._motion_buttons:
+            btn.config(state=state)
+
+        # Swap Connect ↔ Disconnect label and lock the port fields while connected
+        self.connect_button.config(text="Disconnect" if connected else "Connect")
+        self.port_entry.config(state="disabled" if connected else "normal")
+        self.baud_entry.config(state="disabled" if connected else "normal")
+
+    def connect(self):
+        """Open the serial connection to the stage Arduino.
+
+        If already connected, this disconnects instead (the button toggles).
+        """
+        if self.comms is not None and self.comms.is_open:
+            self.disconnect()
+            return
+
+        port = self.port_entry.get().strip()
+        if not port:
+            messagebox.showwarning("Missing port", "Please enter a serial port to connect.")
+            return
+
+        try:
+            baud = int(self.baud_entry.get().strip())
+        except ValueError:
+            messagebox.showwarning("Invalid baud", "Baud rate must be a whole number.")
+            return
+
+        try:
+            self.comms = StageCommandComms(port=port, baudrate=baud, timeout=1.0)
+            self._update_connection_state(connected=True)
+            self._set_status(f"Connected to {port}", color="green")
+            # Give the Arduino 500 ms to settle after the connection reset, then
+            # fetch and display the current position.
+            self.root.after(500, self._update_positions)
+            self._schedule_position_update()
+        except Exception as exc:
+            self.comms = None
+            self._set_status(f"Connect failed: {exc}", color="red")
+            messagebox.showerror("Connection failed", str(exc))
+
+    def disconnect(self):
+        """Close the serial connection to the stage Arduino."""
+        self.disable_motion()  # send disable motion before disconnecting.
+
+        if self.comms is None:
+            return
+        try:
+            self.comms.close()
+        except Exception:
+            pass
+        self.comms = None
+        self._update_connection_state(connected=False)
+        self._set_status("Disconnected", color="red")
+        self._update_positions()   # resets the position labels to "--"
+
+        # Stop the force sensor connection too, if it is running
+        if self._force_running:
+            try:
+                self._stop_force()
+            except Exception:
+                pass
+
+    # =========================================================================
+    # STAGE MOTION
+    # =========================================================================
+
+    def move_axis(self, axis, negative=False):
+        """Send a relative move command for one axis.
+
+        Parameters
+        ----------
+        axis:     "X", "Y", or "Z"
+        negative: True to move in the negative direction
+        """
+        if self.comms is None or not self.comms.is_open:
+            messagebox.showwarning("Not connected", "Please connect to the Arduino before moving.")
+            return
+
+        # Read the step size from the appropriate entry box
+        raw = self.xy_step_entry.get().strip() if axis in {"X", "Y"} else self.z_step_entry.get().strip()
+        try:
+            step = float(raw)
+        except ValueError:
+            messagebox.showwarning("Invalid step size", f"'{raw}' is not a valid number for the {axis} step.")
+            return
+
+        if negative:
+            step = -step
+
+        x = step if axis == "X" else 0.0
+        y = step if axis == "Y" else 0.0
+        z = step if axis == "Z" else 0.0
+
+        try:
+            self.comms.move_relative(x, y, z)
+            self._set_status(f"Sent move_rel  X={x:.3f}  Y={y:.3f}  Z={z:.3f}")
+            # Refresh positions shortly after — small delay lets the Arduino complete the move
+            self.root.after(100, self._update_positions)
+        except Exception as exc:
+            self._set_status(f"Move failed: {exc}", color="red")
+            messagebox.showerror("Move failed", str(exc))
+
+    def enable_motion(self):
+        """Send the ENABLE command to energise the stepper motors."""
+        self._send_simple_command(self.comms.enable, "Enabled motion")
+
+    def disable_motion(self):
+        """Send the DISABLE command to de-energise the stepper motors."""
+        self._send_simple_command(self.comms.disable, "Disabled motion")
+
+    def stop_motion(self):
+        """Send the STOP command to immediately halt all movement."""
+        self._send_simple_command(self.comms.stop, "Stop command sent")
+
+    def _send_simple_command(self, command_fn, success_message):
+        """Call *command_fn* and update the status label. Shows an error dialog on failure."""
+        if self.comms is None or not self.comms.is_open:
+            messagebox.showwarning("Not connected", "Please connect before sending commands.")
+            return
+        try:
+            command_fn()
+            self._set_status(success_message)
+        except Exception as exc:
+            self._set_status(f"Command failed: {exc}", color="red")
+            messagebox.showerror("Command failed", str(exc))
+
+    def set_speed(self):
+        """Read the X/Y/Z speed entries (mm/s), convert to µs/step, and send to Arduino.
+
+        The conversion uses each axis's steps/mm derived from the motor's physical
+        constants (lead-screw pitch, steps/rev, microstepping) and the firmware's
+        timing formula:
+
+            speed_us = 500,000 / (mm_per_s × steps_per_mm)
+
+        X and Y use XY_STEPS_PER_MM; Z uses Z_STEPS_PER_MM.
+        """
+        if self.comms is None or not self.comms.is_open:
+            messagebox.showwarning("Not connected", "Please connect to the Arduino before setting speed.")
+            return
+
+        # Map each axis to its entry widget and the correct steps/mm constant.
+        axis_info = [
+            ("X", self.x_speed_entry, XY_STEPS_PER_MM),
+            ("Y", self.y_speed_entry, XY_STEPS_PER_MM),
+            ("Z", self.z_speed_entry, Z_STEPS_PER_MM),
+        ]
+
+        errors = []
+        mm_per_s_values = {}
+        for axis, entry, _ in axis_info:
+            raw = entry.get().strip()
+            try:
+                value = float(raw)
+                if value <= 0:
+                    raise ValueError("must be greater than zero")
+                mm_per_s_values[axis] = value
+            except ValueError:
+                errors.append(f"{axis}: '{raw}' is not a valid positive number")
+
+        if errors:
+            messagebox.showwarning("Invalid speed", "\n".join(errors))
+            return
+
+        # Convert mm/s → µs/step for each axis
+        us_per_step = {
+            axis: mm_per_s_to_us_per_step(mm_per_s_values[axis], steps_per_mm)
+            for axis, _, steps_per_mm in axis_info
+        }
+
+        try:
+            self.comms.set_speed(us_per_step["X"], us_per_step["Y"], us_per_step["Z"])
+            self._set_status(
+                f"Speed set  "
+                f"X={mm_per_s_values['X']:.2f} mm/s ({us_per_step['X']} µs/step)  "
+                f"Y={mm_per_s_values['Y']:.2f} mm/s ({us_per_step['Y']} µs/step)  "
+                f"Z={mm_per_s_values['Z']:.2f} mm/s ({us_per_step['Z']} µs/step)"
+            )
+        except Exception as exc:
+            self._set_status(f"Set speed failed: {exc}", color="red")
+            messagebox.showerror("Set speed failed", str(exc))
+
     def _update_positions(self):
-        """Query and update the current motor positions."""
+        """Ask the stage for its current position and update the X/Y/Z labels."""
         if self.comms is None or not self.comms.is_open:
             self.x_pos_label.config(text="--")
             self.y_pos_label.config(text="--")
@@ -198,7 +566,9 @@ class StageControlGUI:
 
         try:
             self.comms.query_position()
-            response = self.comms.wait_for_response(expected_type=self.comms.RESPONSE_POSITION, timeout=1.0)
+            response = self.comms.wait_for_response(
+                expected_type=self.comms.RESPONSE_POSITION, timeout=1.0
+            )
             if response and response.type == self.comms.RESPONSE_POSITION:
                 x = response.payload.get("x_mm", 0.0)
                 y = response.payload.get("y_mm", 0.0)
@@ -214,377 +584,489 @@ class StageControlGUI:
             self.x_pos_label.config(text="ERR")
             self.y_pos_label.config(text="ERR")
             self.z_pos_label.config(text="ERR")
-            print(f"Position query failed: {exc}")  # For debugging
+            print(f"Position query failed: {exc}")
 
     def _schedule_position_update(self):
-        """Schedule the next position update if connected."""
+        """Re-schedule position polling as long as the stage is connected."""
         if self.comms is not None and self.comms.is_open:
-            self.root.after(2000, self._schedule_position_update)  # Update every 2 seconds
             self._update_positions()
+            self.root.after(POSITION_UPDATE_MS, self._schedule_position_update)
 
-    def _update_connection_state(self, connected):
-        state = "normal" if connected else "disabled"
-        self.enable_button.config(state=state)
-        self.disable_button.config(state=state)
-        self.stop_button.config(state=state)
+    # =========================================================================
+    # FORCE SENSOR
+    # =========================================================================
 
-        for child in self.main_frame.winfo_children():
-            if isinstance(child, ttk.LabelFrame) and child.cget("text") == "Motion controls":
-                for button in child.winfo_children():
-                    if isinstance(button, ttk.Button) and button not in {self.enable_button, self.disable_button, self.stop_button}:
-                        button.config(state=state)
-
-        self.connect_button.config(text="Disconnect" if connected else "Connect")
-        self.port_entry.config(state="disabled" if connected else "normal")
-        self.baud_entry.config(state="disabled" if connected else "normal")
-        self.xy_step_entry.config(state="normal")
-        self.z_step_entry.config(state="normal")
-
-    def connect(self):
-        if self.comms is not None and self.comms.is_open:
-            self.disconnect()
-            return
-
-        port = self.port_entry.get().strip()
-        baud_text = self.baud_entry.get().strip()
-
-        if not port:
-            messagebox.showwarning("Missing port", "Please enter a serial port to connect.")
-            return
-
-        try:
-            baud = int(baud_text)
-        except ValueError:
-            messagebox.showwarning("Invalid baud", "Baud rate must be a whole number.")
-            return
-
-        try:
-            self.comms = StageCommandComms(port=port, baudrate=baud, timeout=1.0)
-            self._update_connection_state(True)
-            self._set_status(f"Connected to {port}", color="green")
-            # Update positions on connect
-            self.root.after(500, self._update_positions)  # Delay to allow Arduino to settle
-            # Start periodic position updates
-            self._schedule_position_update()
-        except Exception as exc:
-            self.comms = None
-            self._set_status(f"Connect failed: {exc}", color="red")
-            messagebox.showerror("Connection failed", str(exc))
-
-    def disconnect(self):
-        if self.comms is None:
-            return
-        try:
-            self.comms.close()
-        except Exception:
-            pass
-        self.comms = None
-        self._update_connection_state(False)
-        self._set_status("Disconnected", color="red")
-        self._update_positions()  # Reset positions to --
-        # also stop force connection if any
-        if getattr(self, '_force_running', False):
-            try:
-                self._stop_force()
-            except Exception:
-                pass
-
-    def _parse_step(self, axis):
-        raw = self.xy_step_entry.get().strip() if axis in {"X", "Y"} else self.z_step_entry.get().strip()
-        try:
-            value = float(raw)
-        except ValueError:
-            raise ValueError(f"Invalid {axis} step size: {raw}")
-        return value
-
-    def move_axis(self, axis, negative=False):
-        if self.comms is None or not self.comms.is_open:
-            messagebox.showwarning("Not connected", "Please connect to the Arduino before moving stages.")
-            return
-
-        try:
-            step = self._parse_step(axis)
-        except ValueError as exc:
-            messagebox.showwarning("Invalid step size", str(exc))
-            return
-
-        if negative:
-            step = -step
-
-        x = step if axis == "X" else 0.0
-        y = step if axis == "Y" else 0.0
-        z = step if axis == "Z" else 0.0
-
-        try:
-            self.comms.move_relative(x, y, z)
-            self._set_status(f"Sent move_rel {x:.3f}, {y:.3f}, {z:.3f}")
-            # Update positions after move
-            self.root.after(100, self._update_positions)  # Small delay to allow move to complete
-        except Exception as exc:
-            self._set_status(f"Move failed: {exc}", color="red")
-            messagebox.showerror("Move failed", str(exc))
-
-    def enable_motion(self):
-        self._send_simple_command(self.comms.enable, "Enabled motion")
-
-    def disable_motion(self):
-        self._send_simple_command(self.comms.disable, "Disabled motion")
-
-    def stop_motion(self):
-        self._send_simple_command(self.comms.stop, "Stop command sent")
-
-    def _send_simple_command(self, command_fn, success_message):
-        if self.comms is None or not self.comms.is_open:
-            messagebox.showwarning("Not connected", "Please connect before sending commands.")
-            return
-
-        try:
-            command_fn()
-            self._set_status(success_message)
-        except Exception as exc:
-            self._set_status(f"Command failed: {exc}", color="red")
-            messagebox.showerror("Command failed", str(exc))
-
-    # ---- Force sensor handling ----
     def toggle_force(self):
-        if getattr(self, '_force_running', False):
+        """Connect to or disconnect from the force-sensor Arduino."""
+        if self._force_running:
             self._stop_force()
         else:
             self._start_force()
 
     def _start_force(self):
+        """Open the force-sensor serial port and start the background reader thread."""
         if serial is None:
-            messagebox.showerror("Missing dependency", "pyserial is required for force sensor support")
+            messagebox.showerror("Missing dependency", "pyserial is required for force sensor support.")
             return
+
         port = self.force_port_entry.get().strip()
         try:
             baud = int(self.force_baud_entry.get().strip())
         except ValueError:
             messagebox.showwarning("Invalid baud", "Baud rate must be a whole number.")
             return
+
         try:
             self._force_serial = serial.Serial(port, baud, timeout=1.0)
         except Exception as exc:
             messagebox.showerror("Open failed", str(exc))
             return
+
         self._force_running = True
         self.force_connect_button.config(text="Disconnect Force")
-        self._force_thread = threading.Thread(target=self._force_reader_loop, daemon=True)
-        self._force_thread.start()
         self.force_calib_button.config(state="normal")
 
+        # Start the reader in a daemon thread so it exits automatically when
+        # the main window is closed.
+        self._force_thread = threading.Thread(target=self._force_reader_loop, daemon=True)
+        self._force_thread.start()
+
     def _stop_force(self):
+        """Stop the background reader thread and close the force serial port."""
         self._force_running = False
         if self._force_thread is not None:
             self._force_thread.join(timeout=1.0)
-        try:
-            if self._force_serial is not None:
+        if self._force_serial is not None:
+            try:
                 self._force_serial.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
         self._force_serial = None
         self._force_thread = None
         self.force_connect_button.config(text="Connect Force")
         self.force_calib_button.config(state="disabled")
 
     def _force_reader_loop(self):
-        while getattr(self, '_force_running', False) and self._force_serial is not None:
-            # Try to acquire serial lock briefly; if an exclusive operation
-            # (calibration) holds the lock, skip this read to avoid stealing responses.
-            got = self._force_serial_lock.acquire(timeout=0.1)
-            if not got:
+        """Background thread: continuously read force values from the serial port.
+
+        Each line from the Arduino is expected to look like:  <FORCE,123.45>
+        Parsed values are stored in self._force_data as (timestamp, grams) tuples.
+        Old data outside the rolling window is discarded automatically.
+        """
+        while self._force_running and self._force_serial is not None:
+            # Try to get the serial lock briefly.
+            # If the calibration code is currently holding the lock we skip this
+            # read cycle rather than blocking — this keeps calibration commands
+            # from racing with streaming data reads.
+            got_lock = self._force_serial_lock.acquire(timeout=0.1)
+            if not got_lock:
                 time.sleep(0.01)
                 continue
+
             try:
                 try:
-                    line = self._force_serial.readline().decode('utf-8', errors='ignore').strip()
+                    line = self._force_serial.readline().decode("utf-8", errors="ignore").strip()
                 except Exception:
-                    line = ''
+                    line = ""
+
                 if not line:
                     continue
-                m = self._force_line_re.search(line)
-                if m:
+
+                match = self._force_regex.search(line)
+                if match:
                     try:
-                        val = float(m.group(1))
-                    except Exception:
+                        force_value = float(match.group(1))
+                    except ValueError:
                         continue
+
                     now = time.time()
                     with self._force_lock:
-                        self._force_data.append((now, val))
-                        cutoff = now - self._force_window_s
+                        self._force_data.append((now, force_value))
+                        # Remove readings older than the display window
+                        cutoff = now - FORCE_WINDOW_S
                         while self._force_data and self._force_data[0][0] < cutoff:
                             self._force_data.popleft()
-                # ignore other lines
             finally:
-                try:
-                    self._force_serial_lock.release()
-                except Exception:
-                    pass
+                self._force_serial_lock.release()
 
     def _schedule_force_plot(self):
-        self.root.after(250, self._schedule_force_plot)
-        # update plot
-        with self._force_lock:
-            if not self._force_data:
-                xs, ys = [], []
-            else:
-                now = time.time()
-                xs = [t - now for (t, v) in self._force_data]
-                ys = [v for (t, v) in self._force_data]
-        # plot with time axis from -window..0
-        # Always use fixed Y limits: top 100, bottom -1000 grams
-        if xs:
-            self.force_line.set_xdata(xs)
-            self.force_line.set_ydata(ys)
-            self.force_ax.set_xlim(-self._force_window_s, 0)
-            self.force_ax.set_title('Current Force: {:.1f} g'.format(ys[-1]))
+        """Redraw the live force graph, then schedule the next redraw.
 
+        This runs on the main (GUI) thread via Tkinter's after() mechanism.
+        It is safe to update Tkinter widgets from here.
+        """
+        # Grab a snapshot of the current data under the lock so the reader
+        # thread can keep writing without waiting for us to finish drawing.
+        with self._force_lock:
+            if self._force_data:
+                now = time.time()
+                # Convert absolute timestamps to seconds-ago (negative = past)
+                times  = [t - now for (t, _) in self._force_data]
+                values = [v       for (_, v) in self._force_data]
+            else:
+                times, values = [], []
+
+        if times:
+            self.force_line.set_xdata(times)
+            self.force_line.set_ydata(values)
+            self.force_ax.set_xlim(-FORCE_WINDOW_S, 0)
+            self.force_ax.set_title(f"Current Force: {values[-1]:.1f} g")
         else:
             self.force_line.set_xdata([])
             self.force_line.set_ydata([])
-            self.force_ax.set_xlim(-self._force_window_s, 0)
-        self.force_ax.set_ylim(-100, 1000)
+            self.force_ax.set_xlim(-FORCE_WINDOW_S, 0)
+
+        try:
+            y_max = float(self.force_y_max_entry.get().strip())
+        except ValueError:
+            y_max = DEFAULT_FORCE_Y_MAX
+        self.force_ax.set_ylim(0, y_max)
+
         try:
             self.force_canvas.draw_idle()
         except Exception:
             pass
 
-    def _read_force_response(self, timeout=5.0):
-        """Read lines from force serial until a framed <...> line is returned or timeout."""
-        if self._force_serial is None:
-            return None
-        # Acquire exclusive access to the serial port for this response read
-        acquired = self._force_serial_lock.acquire(timeout=timeout)
-        if not acquired:
-            return None
-        try:
-            end = time.time() + timeout
-            while time.time() < end:
-                try:
-                    line = self._force_serial.readline().decode('utf-8', errors='ignore').strip()
-                except Exception:
-                    line = ''
-                if not line:
-                    continue
-                if line.startswith('<') and line.endswith('>'):
-                    return line
-            return None
-        finally:
-            try:
-                self._force_serial_lock.release()
-            except Exception:
-                pass
+        # Schedule the next update
+        self.root.after(FORCE_PLOT_MS, self._schedule_force_plot)
 
-    def _send_force_and_wait(self, cmd, wait_prefix=None, timeout=5.0):
+    # =========================================================================
+    # FORCE SENSOR CALIBRATION
+    # =========================================================================
+
+    def _send_force_command(self, cmd, wait_prefix=None, timeout=5.0):
+        """Send a text command to the force sensor and optionally wait for a reply.
+
+        Parameters
+        ----------
+        cmd:         Command string to send (e.g. "CALIBRATE")
+        wait_prefix: If given, block until a response starting with this prefix
+                     arrives (e.g. "STATUS,ZERO_DONE"). Returns None on timeout.
+        timeout:     Maximum seconds to wait for the response.
+
+        Returns the raw response string, or None if not waiting / timed out.
+        """
         if self._force_serial is None:
             return None
+
         try:
-            self._force_serial.write((cmd + '\n').encode('utf-8'))
+            self._force_serial.write((cmd + "\n").encode("utf-8"))
             self._force_serial.flush()
         except Exception:
             return None
+
         if wait_prefix is None:
             return None
-        # Hold exclusive access to serial for command-response sequence
+
+        # Hold the serial lock so the reader thread does not consume the response
+        # we are waiting for.
         acquired = self._force_serial_lock.acquire(timeout=timeout)
         if not acquired:
             return None
+
         try:
-            end = time.time() + timeout
-            while time.time() < end:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
                 try:
-                    resp = self._force_serial.readline().decode('utf-8', errors='ignore').strip()
+                    resp = self._force_serial.readline().decode("utf-8", errors="ignore").strip()
                 except Exception:
-                    resp = ''
-                if not resp:
-                    continue
+                    resp = ""
                 if resp.startswith(f"<{wait_prefix}"):
                     return resp
             return None
         finally:
-            try:
-                self._force_serial_lock.release()
-            except Exception:
-                pass
+            self._force_serial_lock.release()
 
     def _force_calibrate(self):
+        """Run a two-point calibration sequence for the force sensor.
+
+        Steps
+        -----
+        1. Tell the sensor to start calibration.
+        2. Ask the user to remove all load, then confirm zero.
+        3. Ask the user to place a known weight on the sensor.
+        4. Send the known weight to the sensor so it can compute the scale factor.
+        5. Optionally save the calibration to the sensor's EEPROM.
+        """
         if self._force_serial is None:
             messagebox.showwarning("Not connected", "Connect to the force sensor first.")
             return
-        # Start calibration
-        self._send_force_and_wait('CALIBRATE', wait_prefix='STATUS', timeout=2.0)
-        # Prompt user to remove load
-        if not messagebox.askokcancel('Calibration', 'Remove all load from the sensor, then press OK to confirm zero.'):
-            return
-        # confirm zero
-        zero_resp = self._send_force_and_wait('CONFIRM_ZERO', wait_prefix='STATUS,ZERO_DONE', timeout=10.0)
-        if zero_resp is None:
-            messagebox.showerror('Calibration', 'Zeroing failed or timed out.')
-            return
-        # parse offset
-        m = re.search(r"<STATUS,ZERO_DONE,\s*([+-]?\d+)>", zero_resp)
-        offset = None
-        if m:
-            offset = int(m.group(1))
 
-        # Inform user and present a non-modal dialog so they can move the stage
-        msg = ('Zero recorded. Please apply a known weight and position the stage as needed. When ready, enter the weight (grams) below and click Apply Weight.')
+        # Step 1: Start calibration on the sensor
+        self._send_force_command("CALIBRATE", wait_prefix="STATUS", timeout=2.0)
+
+        # Step 2: Zero the sensor with no load
+        if not messagebox.askokcancel(
+            "Calibration",
+            "Remove all load from the sensor, then press OK to record the zero point.",
+        ):
+            return
+
+        zero_resp = self._send_force_command(
+            "CONFIRM_ZERO", wait_prefix="STATUS,ZERO_DONE", timeout=10.0
+        )
+        if zero_resp is None:
+            messagebox.showerror("Calibration", "Zeroing failed or timed out.")
+            return
+
+        # Step 3: Open a dialog so the user can place a weight and enter its value.
+        # We use a non-blocking (non-modal) window so the user can still move the
+        # stage while the dialog is open.
         dlg = tk.Toplevel(self.root)
-        dlg.title('Calibration - Apply Weight')
-        dlg.geometry('360x120')
-        ttk.Label(dlg, text=msg, wraplength=340).pack(padx=8, pady=6)
+        dlg.title("Calibration — Apply Weight")
+        dlg.geometry("360x120")
+        dlg.transient(self.root)
+        dlg.grab_release()   # allow the main window to stay interactive
+
+        ttk.Label(
+            dlg,
+            text=(
+                "Zero recorded. Place a known weight on the sensor and position the stage "
+                "as needed. Enter the weight in grams below, then click Apply Weight."
+            ),
+            wraplength=340,
+        ).pack(padx=8, pady=6)
+
         entry_frame = ttk.Frame(dlg)
-        entry_frame.pack(fill='x', padx=8, pady=4)
-        ttk.Label(entry_frame, text='Weight (g):').grid(row=0, column=0, sticky='w')
+        entry_frame.pack(fill="x", padx=8, pady=4)
+        ttk.Label(entry_frame, text="Weight (g):").grid(row=0, column=0, sticky="w")
         weight_entry = ttk.Entry(entry_frame)
-        weight_entry.grid(row=0, column=1, sticky='ew', padx=6)
+        weight_entry.grid(row=0, column=1, sticky="ew", padx=6)
         entry_frame.columnconfigure(1, weight=1)
 
         def on_apply():
-            val = weight_entry.get().strip()
+            """Called when the user clicks Apply Weight."""
             try:
-                w = float(val)
-            except Exception:
-                messagebox.showerror('Calibration', 'Invalid weight entered.')
+                weight_g = float(weight_entry.get().strip())
+            except ValueError:
+                messagebox.showerror("Calibration", "Please enter a valid number for the weight.")
                 return
+
             dlg.destroy()
-            # perform SET_WEIGHT and continue flow
-            setresp = self._send_force_and_wait(f'SET_WEIGHT,{w}', wait_prefix='STATUS,CAL_COMPLETE', timeout=10.0)
-            if setresp is None:
-                messagebox.showerror('Calibration', 'Calibration step failed or timed out.')
+
+            # Step 4: Send the known weight so the sensor can compute its scale factor
+            cal_resp = self._send_force_command(
+                f"SET_WEIGHT,{weight_g}",
+                wait_prefix="STATUS,CAL_COMPLETE",
+                timeout=10.0,
+            )
+            if cal_resp is None:
+                messagebox.showerror("Calibration", "Calibration step failed or timed out.")
                 return
-            m2 = re.search(r"<STATUS,CAL_COMPLETE,\s*([+-]?\d+),\s*([0-9.+-eE]+)>", setresp)
+
+            # Parse the offset and scale factor out of the response
+            match = re.search(r"<STATUS,CAL_COMPLETE,\s*([+-]?\d+),\s*([0-9.+\-eE]+)>", cal_resp)
+            offset    = None
             scale_val = None
-            if m2:
+            if match:
                 try:
-                    offset = int(m2.group(1))
-                except Exception:
-                    offset = None
-                try:
-                    scale_val = float(m2.group(2))
-                except Exception:
-                    scale_val = None
-            message = f'Calibration complete. Offset={offset}, Scale={scale_val:.6f}' if scale_val is not None else 'Calibration complete.'
-            if messagebox.askyesno('Calibration', message + '\n\nSave calibration to device EEPROM?'):
-                self._send_force_and_wait('SAVE_CAL', wait_prefix='STATUS,CAL_SAVED', timeout=3.0)
-                messagebox.showinfo('Calibration', 'Calibration saved.')
+                    offset    = int(match.group(1))
+                    scale_val = float(match.group(2))
+                except ValueError:
+                    pass
+
+            if scale_val is not None:
+                summary = f"Calibration complete.\nOffset = {offset},  Scale = {scale_val:.6f}"
             else:
-                messagebox.showinfo('Calibration', 'Calibration not saved.')
+                summary = "Calibration complete."
+
+            # Step 5: Offer to save to EEPROM
+            if messagebox.askyesno("Calibration", summary + "\n\nSave calibration to device EEPROM?"):
+                self._send_force_command("SAVE_CAL", wait_prefix="STATUS,CAL_SAVED", timeout=3.0)
+                messagebox.showinfo("Calibration", "Calibration saved to EEPROM.")
+            else:
+                messagebox.showinfo("Calibration", "Calibration not saved.")
 
         def on_cancel():
+            """Called when the user clicks Cancel."""
             dlg.destroy()
-            messagebox.showinfo('Calibration', 'Calibration cancelled.')
+            messagebox.showinfo("Calibration", "Calibration cancelled.")
 
         btn_frame = ttk.Frame(dlg)
-        btn_frame.pack(fill='x', padx=8, pady=6)
-        apply_btn = ttk.Button(btn_frame, text='Apply Weight', command=on_apply)
-        apply_btn.pack(side='right', padx=6)
-        cancel_btn = ttk.Button(btn_frame, text='Cancel', command=on_cancel)
-        cancel_btn.pack(side='right')
-        # Allow user to interact with main window while this dialog is open
-        dlg.transient(self.root)
-        dlg.grab_release()
+        btn_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Button(btn_frame, text="Apply Weight", command=on_apply).pack(side="right", padx=6)
+        ttk.Button(btn_frame, text="Cancel",       command=on_cancel).pack(side="right")
 
+    # =========================================================================
+    # TOUCH SENSOR
+    # =========================================================================
+
+    def _build_touch_frame(self):
+        """Right panel row 1 — Trill flex sensor connection and live capacitance bar chart.
+
+        The Trill firmware sends one line per reading, containing space-separated
+        4-digit zero-padded integers — one value per sensing channel.
+        Example line:  0234 0412 0089 0731 ...
+
+        The bar chart shows the most recent line: one bar per channel, with
+        channel index on the X axis and raw capacitance value on the Y axis.
+        The chart refreshes every TOUCH_PLOT_MS milliseconds.
+        """
+        touch = ttk.LabelFrame(self.right_panel, text="Touch Sensor (Trill Flex)")
+        touch.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
+        touch.columnconfigure(1, weight=1)  # port entry expands
+        touch.rowconfigure(1, weight=1)     # graph row expands
+
+        # --- Serial port controls ---
+        ttk.Label(touch, text="Port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        self.touch_port_entry = ttk.Entry(touch)
+        self.touch_port_entry.insert(0, DEFAULT_TOUCH_PORT)
+        self.touch_port_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+
+        ttk.Label(touch, text="Baud:").grid(row=0, column=2, sticky="w", padx=4, pady=4)
+        self.touch_baud_entry = ttk.Entry(touch, width=8)
+        self.touch_baud_entry.insert(0, str(DEFAULT_BAUD))
+        self.touch_baud_entry.grid(row=0, column=3, sticky="w", padx=4, pady=4)
+
+        self.touch_connect_button = ttk.Button(
+            touch, text="Connect Touch", command=self.toggle_touch
+        )
+        self.touch_connect_button.grid(row=0, column=4, sticky="e", padx=4, pady=4)
+
+        # Y-axis max — user can type a new value; the plot picks it up on the next redraw
+        ttk.Label(touch, text="Y max:").grid(row=0, column=5, sticky="w", padx=(8, 2), pady=4)
+        self.touch_y_max_entry = ttk.Entry(touch, width=6)
+        self.touch_y_max_entry.insert(0, str(DEFAULT_TOUCH_Y_MAX))
+        self.touch_y_max_entry.grid(row=0, column=6, sticky="w", padx=(0, 4), pady=4)
+
+        # --- Matplotlib bar chart ---
+        self.touch_fig = Figure(figsize=(6, 2.5), dpi=100)
+        self.touch_ax  = self.touch_fig.add_subplot(111)
+        self.touch_ax.set_title("Touch Sensor — no data yet")
+        self.touch_ax.set_xlabel("Channel")
+        self.touch_ax.set_ylabel("Raw value")
+
+        self.touch_canvas = FigureCanvasTkAgg(self.touch_fig, master=touch)
+        self.touch_canvas.get_tk_widget().grid(
+            row=1, column=0, columnspan=7, sticky="nsew"
+        )
+
+        # --- Internal state ---
+        self._touch_lock    = threading.Lock()
+        self._touch_values  = []    # most recent parsed line as a list of ints
+        self._touch_serial  = None  # serial.Serial object when connected
+        self._touch_thread  = None  # background reader thread
+        self._touch_running = False
+
+        # Start the periodic chart redraw (runs even before a sensor is connected)
+        self._schedule_touch_plot()
+
+    def toggle_touch(self):
+        """Connect to or disconnect from the Trill touch sensor Arduino."""
+        if self._touch_running:
+            self._stop_touch()
+        else:
+            self._start_touch()
+
+    def _start_touch(self):
+        """Open the touch sensor serial port and start the background reader thread."""
+        if serial is None:
+            messagebox.showerror("Missing dependency", "pyserial is required for touch sensor support.")
+            return
+
+        port = self.touch_port_entry.get().strip()
+        try:
+            baud = int(self.touch_baud_entry.get().strip())
+        except ValueError:
+            messagebox.showwarning("Invalid baud", "Baud rate must be a whole number.")
+            return
+
+        try:
+            self._touch_serial = serial.Serial(port, baud, timeout=1.0)
+        except Exception as exc:
+            messagebox.showerror("Open failed", str(exc))
+            return
+
+        self._touch_running = True
+        self.touch_connect_button.config(text="Disconnect Touch")
+        self.touch_port_entry.config(state="disabled")
+        self.touch_baud_entry.config(state="disabled")
+
+        self._touch_thread = threading.Thread(target=self._touch_reader_loop, daemon=True)
+        self._touch_thread.start()
+
+    def _stop_touch(self):
+        """Stop the background reader thread and close the touch sensor serial port."""
+        self._touch_running = False
+        if self._touch_thread is not None:
+            self._touch_thread.join(timeout=1.0)
+        if self._touch_serial is not None:
+            try:
+                self._touch_serial.close()
+            except Exception:
+                pass
+        self._touch_serial  = None
+        self._touch_thread  = None
+        self.touch_connect_button.config(text="Connect Touch")
+        self.touch_port_entry.config(state="normal")
+        self.touch_baud_entry.config(state="normal")
+
+    def _touch_reader_loop(self):
+        """Background thread: read lines from the Trill serial port.
+
+        Each line from the firmware looks like:
+            0234 0412 0089 0731 ...
+        We parse it as a list of integers and store it in self._touch_values.
+        Only the most recent complete line is kept — the bar chart always shows
+        the latest snapshot.
+        """
+        while self._touch_running and self._touch_serial is not None:
+            try:
+                line = self._touch_serial.readline().decode("utf-8", errors="ignore").strip()
+            except Exception:
+                continue
+
+            if not line:
+                continue
+
+            # Each token is a zero-padded integer, e.g. "0234"
+            try:
+                values = [int(token) for token in line.split()]
+            except ValueError:
+                continue  # skip any lines that don't parse cleanly
+
+            if values:
+                with self._touch_lock:
+                    self._touch_values = values
+
+    def _schedule_touch_plot(self):
+        """Redraw the touch bar chart with the latest channel values, then reschedule.
+
+        This runs on the main (GUI) thread so it is safe to update Tkinter widgets.
+        """
+        with self._touch_lock:
+            values = list(self._touch_values)  # snapshot so we release the lock quickly
+
+        self.touch_ax.cla()  # clear previous bars
+
+        try:
+            y_max = float(self.touch_y_max_entry.get().strip())
+        except ValueError:
+            y_max = DEFAULT_TOUCH_Y_MAX
+
+        if values:
+            n = len(values)
+            self.touch_ax.bar(range(n), values, color="steelblue")
+            self.touch_ax.set_title(f"Touch Sensor — {n} channels,  latest reading")
+            self.touch_ax.set_xlim(-0.5, n - 0.5)
+        else:
+            self.touch_ax.set_title("Touch Sensor — no data yet")
+
+        self.touch_ax.set_xlabel("Channel")
+        self.touch_ax.set_ylabel("Raw value")
+        self.touch_ax.set_ylim(0, y_max)
+
+        try:
+            self.touch_canvas.draw_idle()
+        except Exception:
+            pass
+
+        self.root.after(TOUCH_PLOT_MS, self._schedule_touch_plot)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     root = tk.Tk()

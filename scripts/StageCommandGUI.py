@@ -4,7 +4,7 @@ Provides a Tkinter desktop window that lets you:
   - Connect to the stage Arduino over USB serial
   - Move the X, Y, and Z axes by a configurable step size
   - Set the movement speed of each axis independently
-  - Enable, disable, and stop the stepper motors
+  - Stop stepper motors instantly with a Stop button
   - Connect to a separate force-sensor Arduino and view a live force graph
   - Run a two-point force calibration sequence
   - Connect to a Trill flex touch-sensor Arduino and view a live bar chart
@@ -52,6 +52,7 @@ DEFAULT_Z_SPEED_MM_S  = 0.4            # default Z speed (mm/s)
 
 DEFAULT_TOUCH_PORT    = "/dev/ttyACM2"   # serial port for the Trill touch sensor Arduino
 DEFAULT_FORCE_Y_MAX   = 1000            # default upper Y limit on the force graph (grams)
+DEFAULT_TOUCH_Y_MIN   = 0               # default lower Y limit on the touch bar chart (raw units)
 DEFAULT_TOUCH_Y_MAX   = 400             # default upper Y limit on the touch bar chart (raw units)
 
 FORCE_WINDOW_S     = 10.0    # how many seconds of force history to show in the graph
@@ -223,27 +224,24 @@ class StageControlGUI:
         self.set_speed_button.grid(row=0, column=6, sticky="e", padx=4, pady=4)
 
     def _build_control_frame(self):
-        """Left panel row 3 — +/- buttons for each axis plus Enable / Disable / Stop."""
+        """Left panel row 3 — +/- buttons for each axis plus a Stop button.
+
+        Motors are enabled automatically before each move and disabled
+        immediately afterwards, so no manual Enable/Disable buttons are needed.
+        """
         control = ttk.LabelFrame(self.left_panel, text="Motion controls")
         control.grid(row=3, column=0, sticky="nsew", padx=2, pady=2)
         control.columnconfigure(0, weight=1)
-        control.columnconfigure(1, weight=1)
-        control.columnconfigure(2, weight=1)
 
         axis_frame = ttk.Frame(control)
-        axis_frame.grid(row=0, column=0, columnspan=3, sticky="nsew", padx=4, pady=4)
+        axis_frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
         self._add_axis_buttons(axis_frame, "X", row=0)
         self._add_axis_buttons(axis_frame, "Y", row=1)
         self._add_axis_buttons(axis_frame, "Z", row=2)
 
-        self.enable_button = ttk.Button(control, text="Enable Motion",  command=self.enable_motion)
-        self.disable_button = ttk.Button(control, text="Disable Motion", command=self.disable_motion)
-        self.stop_button   = ttk.Button(control, text="Stop",           command=self.stop_motion)
-
-        self.enable_button.grid( row=1, column=0, sticky="ew", padx=4, pady=6)
-        self.disable_button.grid(row=1, column=1, sticky="ew", padx=4, pady=6)
-        self.stop_button.grid(   row=1, column=2, sticky="ew", padx=4, pady=6)
+        self.stop_button = ttk.Button(control, text="Stop", command=self.stop_motion)
+        self.stop_button.grid(row=1, column=0, sticky="ew", padx=4, pady=6)
 
     def _add_axis_buttons(self, parent, axis_name, row):
         """Add a label and +/- pair of buttons for one axis to *parent*."""
@@ -366,9 +364,7 @@ class StageControlGUI:
         """Enable or disable controls that require an active stage connection."""
         state = "normal" if connected else "disabled"
 
-        # Enable/disable the Enable, Disable, Stop, and Set Speed buttons
-        self.enable_button.config(state=state)
-        self.disable_button.config(state=state)
+        # Enable/disable the Stop and Set Speed buttons
         self.stop_button.config(state=state)
         self.set_speed_button.config(state=state)
 
@@ -416,8 +412,6 @@ class StageControlGUI:
 
     def disconnect(self):
         """Close the serial connection to the stage Arduino."""
-        self.disable_motion()  # send disable motion before disconnecting.
-
         if self.comms is None:
             return
         try:
@@ -468,37 +462,27 @@ class StageControlGUI:
         z = step if axis == "Z" else 0.0
 
         try:
+            self.comms.enable()
             self.comms.move_relative(x, y, z)
-            self._set_status(f"Sent move_rel  X={x:.3f}  Y={y:.3f}  Z={z:.3f}")
+            self.comms.disable()
+            self._set_status(f"Moved  X={x:.3f}  Y={y:.3f}  Z={z:.3f}")
             # Refresh positions shortly after — small delay lets the Arduino complete the move
             self.root.after(100, self._update_positions)
         except Exception as exc:
             self._set_status(f"Move failed: {exc}", color="red")
             messagebox.showerror("Move failed", str(exc))
 
-    def enable_motion(self):
-        """Send the ENABLE command to energise the stepper motors."""
-        self._send_simple_command(self.comms.enable, "Enabled motion")
-
-    def disable_motion(self):
-        """Send the DISABLE command to de-energise the stepper motors."""
-        self._send_simple_command(self.comms.disable, "Disabled motion")
-
     def stop_motion(self):
         """Send the STOP command to immediately halt all movement."""
-        self._send_simple_command(self.comms.stop, "Stop command sent")
-
-    def _send_simple_command(self, command_fn, success_message):
-        """Call *command_fn* and update the status label. Shows an error dialog on failure."""
         if self.comms is None or not self.comms.is_open:
             messagebox.showwarning("Not connected", "Please connect before sending commands.")
             return
         try:
-            command_fn()
-            self._set_status(success_message)
+            self.comms.stop()
+            self._set_status("Stop command sent")
         except Exception as exc:
-            self._set_status(f"Command failed: {exc}", color="red")
-            messagebox.showerror("Command failed", str(exc))
+            self._set_status(f"Stop failed: {exc}", color="red")
+            messagebox.showerror("Stop failed", str(exc))
 
     def set_speed(self):
         """Read the X/Y/Z speed entries (mm/s), convert to µs/step, and send to Arduino.
@@ -892,22 +876,26 @@ class StageControlGUI:
     # =========================================================================
 
     def _build_touch_frame(self):
-        """Right panel row 1 — Trill flex sensor connection and live capacitance bar chart.
+        """Right panel row 1 — touch sensor connection and live capacitance bar chart.
 
-        The Trill firmware sends one line per reading, containing space-separated
-        4-digit zero-padded integers — one value per sensing channel.
-        Example line:  0234 0412 0089 0731 ...
+        Supports two sensor types, selectable via radio buttons:
 
-        The bar chart shows the most recent line: one bar per channel, with
-        channel index on the X axis and raw capacitance value on the Y axis.
-        The chart refreshes every TOUCH_PLOT_MS milliseconds.
+        Trill Flex (default)
+            Each line is space-separated zero-padded integers, one per channel.
+            Example: 0234 0412 0089 0731 ...
+            All channels are plotted.
+
+        Raspberry Pi Pico
+            Each line is comma-separated floats.
+            Example: 0.0, 1.23, 4.56, 7.89, 0.12, ...
+            Only the 2nd–5th values (indices 1–4) are plotted as 4 bars.
         """
-        touch = ttk.LabelFrame(self.right_panel, text="Touch Sensor (Trill Flex)")
+        touch = ttk.LabelFrame(self.right_panel, text="Touch Sensor")
         touch.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
         touch.columnconfigure(1, weight=1)  # port entry expands
-        touch.rowconfigure(1, weight=1)     # graph row expands
+        touch.rowconfigure(2, weight=1)     # graph row expands
 
-        # --- Serial port controls ---
+        # --- Row 0: serial port controls ---
         ttk.Label(touch, text="Port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.touch_port_entry = ttk.Entry(touch)
         self.touch_port_entry.insert(0, DEFAULT_TOUCH_PORT)
@@ -923,13 +911,43 @@ class StageControlGUI:
         )
         self.touch_connect_button.grid(row=0, column=4, sticky="e", padx=4, pady=4)
 
-        # Y-axis max — user can type a new value; the plot picks it up on the next redraw
-        ttk.Label(touch, text="Y max:").grid(row=0, column=5, sticky="w", padx=(8, 2), pady=4)
+        # Y-axis min/max — user can type new values; the plot picks them up on the next redraw
+        ttk.Label(touch, text="Y min:").grid(row=0, column=5, sticky="w", padx=(8, 2), pady=4)
+        self.touch_y_min_entry = ttk.Entry(touch, width=6)
+        self.touch_y_min_entry.insert(0, str(DEFAULT_TOUCH_Y_MIN))
+        self.touch_y_min_entry.grid(row=0, column=6, sticky="w", padx=(0, 4), pady=4)
+
+        ttk.Label(touch, text="Y max:").grid(row=0, column=7, sticky="w", padx=(4, 2), pady=4)
         self.touch_y_max_entry = ttk.Entry(touch, width=6)
         self.touch_y_max_entry.insert(0, str(DEFAULT_TOUCH_Y_MAX))
-        self.touch_y_max_entry.grid(row=0, column=6, sticky="w", padx=(0, 4), pady=4)
+        self.touch_y_max_entry.grid(row=0, column=8, sticky="w", padx=(0, 4), pady=4)
 
-        # --- Matplotlib bar chart ---
+        # --- Row 1: sensor type selector ---
+        # This controls how incoming serial lines are parsed.
+        # Changing the type while disconnected takes effect on the next connection.
+        self._touch_sensor_type = tk.StringVar(value="trill")
+
+        type_frame = ttk.Frame(touch)
+        type_frame.grid(row=1, column=0, columnspan=7, sticky="w", padx=4, pady=(0, 2))
+
+        ttk.Label(type_frame, text="Sensor type:").pack(side="left", padx=(0, 8))
+
+        self.touch_radio_trill = ttk.Radiobutton(
+            type_frame, text="Trill Flex",
+            variable=self._touch_sensor_type, value="trill",
+        )
+        self.touch_radio_trill.pack(side="left", padx=4)
+
+        self.touch_radio_pico = ttk.Radiobutton(
+            type_frame, text="Raspberry Pi Pico",
+            variable=self._touch_sensor_type, value="pico",
+        )
+        self.touch_radio_pico.pack(side="left", padx=4)
+
+        # Keep a list so we can lock/unlock both buttons together
+        self._touch_type_radios = [self.touch_radio_trill, self.touch_radio_pico]
+
+        # --- Row 2: Matplotlib bar chart ---
         self.touch_fig = Figure(figsize=(6, 2.5), dpi=100)
         self.touch_ax  = self.touch_fig.add_subplot(111)
         self.touch_ax.set_title("Touch Sensor — no data yet")
@@ -938,12 +956,12 @@ class StageControlGUI:
 
         self.touch_canvas = FigureCanvasTkAgg(self.touch_fig, master=touch)
         self.touch_canvas.get_tk_widget().grid(
-            row=1, column=0, columnspan=7, sticky="nsew"
+            row=2, column=0, columnspan=9, sticky="nsew"
         )
 
         # --- Internal state ---
         self._touch_lock    = threading.Lock()
-        self._touch_values  = []    # most recent parsed line as a list of ints
+        self._touch_values  = []    # most recent parsed values as a list of numbers
         self._touch_serial  = None  # serial.Serial object when connected
         self._touch_thread  = None  # background reader thread
         self._touch_running = False
@@ -981,6 +999,8 @@ class StageControlGUI:
         self.touch_connect_button.config(text="Disconnect Touch")
         self.touch_port_entry.config(state="disabled")
         self.touch_baud_entry.config(state="disabled")
+        for radio in self._touch_type_radios:
+            radio.config(state="disabled")
 
         self._touch_thread = threading.Thread(target=self._touch_reader_loop, daemon=True)
         self._touch_thread.start()
@@ -1000,16 +1020,29 @@ class StageControlGUI:
         self.touch_connect_button.config(text="Connect Touch")
         self.touch_port_entry.config(state="normal")
         self.touch_baud_entry.config(state="normal")
+        for radio in self._touch_type_radios:
+            radio.config(state="normal")
 
     def _touch_reader_loop(self):
-        """Background thread: read lines from the Trill serial port.
+        """Background thread: read and parse lines from the touch sensor serial port.
 
-        Each line from the firmware looks like:
-            0234 0412 0089 0731 ...
-        We parse it as a list of integers and store it in self._touch_values.
-        Only the most recent complete line is kept — the bar chart always shows
-        the latest snapshot.
+        Parsing depends on the sensor type selected at connection time:
+
+        Trill Flex
+            Lines are space-separated zero-padded integers.
+            Example:  0234 0412 0089 0731 ...
+            All values are stored.
+
+        Raspberry Pi Pico
+            Lines are comma-separated floats.
+            Example:  0.0, 1.23, 4.56, 7.89, 0.12, ...
+            Only the 2nd–5th values (indices 1–4) are stored as 4 floats.
+            Lines with fewer than 5 fields are skipped.
         """
+        # Snapshot the selected type once at thread start so it stays consistent
+        # for the duration of this connection.
+        sensor_type = self._touch_sensor_type.get()
+
         while self._touch_running and self._touch_serial is not None:
             try:
                 line = self._touch_serial.readline().decode("utf-8", errors="ignore").strip()
@@ -1019,11 +1052,24 @@ class StageControlGUI:
             if not line:
                 continue
 
-            # Each token is a zero-padded integer, e.g. "0234"
-            try:
-                values = [int(token) for token in line.split()]
-            except ValueError:
-                continue  # skip any lines that don't parse cleanly
+            if sensor_type == "trill":
+                # Space-separated zero-padded integers, one per channel
+                try:
+                    values = [int(token) for token in line.split()]
+                except ValueError:
+                    continue
+
+            else:  # "pico"
+                # Comma-separated fields; each field may have trailing whitespace-
+                # separated tokens (e.g. "36.50  a98") — take only the first token
+                # of each field so those extras don't break float parsing.
+                try:
+                    fields = [float(f.strip().split()[0]) for f in line.split(",")]
+                except (ValueError, IndexError):
+                    continue
+                if len(fields) < 5:
+                    continue  # not enough fields — skip this line
+                values = [-f for f in fields[1:5]]  # flip sign so touch is positive.
 
             if values:
                 with self._touch_lock:
@@ -1040,21 +1086,27 @@ class StageControlGUI:
         self.touch_ax.cla()  # clear previous bars
 
         try:
+            y_min = float(self.touch_y_min_entry.get().strip())
+        except ValueError:
+            y_min = DEFAULT_TOUCH_Y_MIN
+        try:
             y_max = float(self.touch_y_max_entry.get().strip())
         except ValueError:
             y_max = DEFAULT_TOUCH_Y_MAX
 
+        sensor_label = "Pico" if self._touch_sensor_type.get() == "pico" else "Trill Flex"
+
         if values:
             n = len(values)
             self.touch_ax.bar(range(n), values, color="steelblue")
-            self.touch_ax.set_title(f"Touch Sensor — {n} channels,  latest reading")
+            self.touch_ax.set_title(f"{sensor_label} — {n} channels,  latest reading")
             self.touch_ax.set_xlim(-0.5, n - 0.5)
         else:
-            self.touch_ax.set_title("Touch Sensor — no data yet")
+            self.touch_ax.set_title(f"{sensor_label} — no data yet")
 
         self.touch_ax.set_xlabel("Channel")
         self.touch_ax.set_ylabel("Raw value")
-        self.touch_ax.set_ylim(0, y_max)
+        self.touch_ax.set_ylim(y_min, y_max)
 
         try:
             self.touch_canvas.draw_idle()

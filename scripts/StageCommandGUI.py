@@ -1,11 +1,23 @@
-"""Stage control GUI for an Arduino-based X/Y/Z stage.
+"""Stage control GUI for Arduino-based X/Y/Z stages.
 
-Run:  python StageCommandGUI.py
+Provides a Tkinter desktop window that lets you:
+  - Connect to the stage Arduino over USB serial
+  - Move the X, Y, and Z axes by a configurable step size
+  - Set the movement speed of each axis independently
+  - Stop stepper motors instantly with a Stop button
+  - Connect to a separate force-sensor Arduino and view a live force graph
+  - Run a two-point force calibration sequence
+  - Connect to a Trill flex touch-sensor Arduino and view a live bar chart
 
-Hardware ports (edit the DEFAULT_* constants below):
-  Stage Arduino  → /dev/ttyACM0
-  Force Arduino  → /dev/ttyACM1
-  Touch Arduino  → /dev/ttyACM2  (Trill Flex or Raspberry Pi Pico)
+Hardware setup
+--------------
+Stage Arduino  → typically /dev/ttyACM0  (Linux) or COM3 (Windows)
+Force Arduino  → typically /dev/ttyACM1  (Linux) or COM4 (Windows)
+Touch Arduino  → typically /dev/ttyACM2  (Linux) or COM5 (Windows)
+
+How to run
+----------
+    python StageCommandGUI.py
 """
 
 import tkinter as tk
@@ -19,7 +31,7 @@ from collections import deque
 try:
     import serial
 except ImportError:
-    serial = None
+    serial = None  # force-sensor features will be disabled if pyserial is missing
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -30,48 +42,54 @@ from StageCommandComms import StageCommandComms
 # ---------------------------------------------------------------------------
 # Default settings — edit these to match your hardware before launching
 # ---------------------------------------------------------------------------
-DEFAULT_STAGE_PORT    = "/dev/ttyACM0"
-DEFAULT_FORCE_PORT    = "/dev/ttyACM1"
-DEFAULT_BAUD          = 115200
-DEFAULT_XY_STEP_MM    = 1.0
-DEFAULT_Z_STEP_MM     = 0.5
-DEFAULT_XY_SPEED_MM_S = 2.0
-DEFAULT_Z_SPEED_MM_S  = 0.4
+DEFAULT_STAGE_PORT    = "/dev/ttyACM0"   # serial port for the stage Arduino
+DEFAULT_FORCE_PORT    = "/dev/ttyACM1"   # serial port for the force-sensor Arduino
+DEFAULT_BAUD          = 115200           # baud rate used by both Arduinos
+DEFAULT_XY_STEP_MM    = 1.0             # default X/Y movement per button press (mm)
+DEFAULT_Z_STEP_MM     = 0.5             # default Z movement per button press (mm)
+DEFAULT_XY_SPEED_MM_S = 2.0            # default X/Y speed (mm/s)
+DEFAULT_Z_SPEED_MM_S  = 0.4            # default Z speed (mm/s)
 
-DEFAULT_TOUCH_PORT    = "/dev/ttyACM2"
-DEFAULT_FORCE_Y_MAX   = 1000
-DEFAULT_TOUCH_Y_MIN   = 0
-DEFAULT_TOUCH_Y_MAX   = 400
+DEFAULT_TOUCH_PORT    = "/dev/ttyACM2"   # serial port for the Trill touch sensor Arduino
+DEFAULT_FORCE_Y_MAX   = 1000            # default upper Y limit on the force graph (grams)
+DEFAULT_TOUCH_Y_MIN   = 0               # default lower Y limit on the touch bar chart (raw units)
+DEFAULT_TOUCH_Y_MAX   = 400             # default upper Y limit on the touch bar chart (raw units)
 
-FORCE_WINDOW_S     = 10.0   # seconds of force history shown in the graph
-FORCE_PLOT_MS      = 250    # how often to redraw the force graph (ms)
-POSITION_UPDATE_MS = 2000   # how often to poll the stage position (ms)
-TOUCH_PLOT_MS      = 100    # how often to redraw the touch bar chart (ms)
+FORCE_WINDOW_S     = 10.0    # how many seconds of force history to show in the graph
+FORCE_PLOT_MS      = 250     # how often to redraw the force graph (milliseconds)
+POSITION_UPDATE_MS = 2000    # how often to poll the stage position (milliseconds)
+
+TOUCH_PLOT_MS = 100          # how often to redraw the touch bar chart (milliseconds)
 
 # ---------------------------------------------------------------------------
 # Motor physical constants — from firmware_stepper/include/common_constants.h
 # ---------------------------------------------------------------------------
+# All three axes use the same motor and microstepping setting.
 _STEPS_PER_REV = 200   # full steps per motor revolution
 _MICROSTEPS    = 16    # microstepping divisor set on the driver board
+
+# Lead-screw pitch differs between axes.
 _XY_MM_PER_REV = 6.35  # X and Y lead screws: 1/4-inch pitch
 _Z_MM_PER_REV  = 1.27  # Z lead screw: finer pitch for better resolution
 
+# Steps per mm — derived from the motor and lead-screw constants above.
 XY_STEPS_PER_MM = (_STEPS_PER_REV * _MICROSTEPS) / _XY_MM_PER_REV  # ≈ 503.9 steps/mm
 Z_STEPS_PER_MM  = (_STEPS_PER_REV * _MICROSTEPS) / _Z_MM_PER_REV   # ≈ 2519.7 steps/mm
 
 
 def mm_per_s_to_us_per_step(mm_per_s, steps_per_mm):
-    """Convert mm/s to the µs/step value the firmware expects.
+    """Convert a speed in mm/s to the µs/step value the firmware expects.
 
-    Derived from firmware timing: next_step_time = now + speed_us * 2
-    → speed_us = 500,000 / (mm_per_s × steps_per_mm)
+    The firmware schedules each step as:
+        next_step_time = now + speed_us * 2   (µs)
+    so:
+        step_freq (steps/s) = 1,000,000 / (speed_us * 2)
+        velocity  (mm/s)    = step_freq / steps_per_mm
+                            = 500,000  / (speed_us * steps_per_mm)
+    Rearranging:
+        speed_us = 500,000 / (mm_per_s * steps_per_mm)
     """
     return max(1, round(500_000 / (mm_per_s * steps_per_mm)))
-
-
-def _parse_baud(entry):
-    """Read an integer baud rate from a ttk.Entry; raise ValueError if invalid."""
-    return int(entry.get().strip())
 
 
 # ---------------------------------------------------------------------------
@@ -85,44 +103,57 @@ class StageControlGUI:
         self.root = root
         self.root.title("Stage Control")
 
+        # comms object is created on connect and set to None when disconnected
         self.comms = None
+
+        # list of axis movement buttons — used to enable/disable them as a group
         self._motion_buttons = []
 
         self._build_widgets()
         self._update_connection_state(connected=False)
 
-    # --- GUI SETUP ---
+    # =========================================================================
+    # GUI SETUP
+    # =========================================================================
 
     def _build_widgets(self):
-        """Two-column layout: stage controls left, sensor plots right."""
+        """Create a two-column layout and call each section builder.
+
+        Left column  — all stage controls (connection, step size, speed, motion, status)
+        Right column — sensor plots stacked vertically (force on top, touch on bottom)
+        """
         self.main_frame = ttk.Frame(self.root, padding=12)
         self.main_frame.grid(sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
+        # Left panel: stage controls sit in column 0 (natural/fixed width)
         self.left_panel = ttk.Frame(self.main_frame)
         self.left_panel.grid(row=0, column=0, sticky="ns", padx=(0, 8))
 
+        # Right panel: sensor plots sit in column 1 (expands to fill remaining width)
         self.right_panel = ttk.Frame(self.main_frame)
         self.right_panel.grid(row=0, column=1, sticky="nsew")
-        self.right_panel.rowconfigure(0, weight=1)
-        self.right_panel.rowconfigure(1, weight=1)
+        self.right_panel.rowconfigure(0, weight=1)  # force frame grows
+        self.right_panel.rowconfigure(1, weight=1)  # touch frame grows
 
-        self.main_frame.columnconfigure(0, weight=0)
-        self.main_frame.columnconfigure(1, weight=1)
+        self.main_frame.columnconfigure(0, weight=0)  # left: don't stretch
+        self.main_frame.columnconfigure(1, weight=1)  # right: take all extra space
         self.main_frame.rowconfigure(0, weight=1)
 
+        # Build left-column frames (rows 0-4 inside left_panel)
         self._build_connection_frame()
         self._build_step_frame()
         self._build_speed_frame()
         self._build_control_frame()
         self._build_status_frame()
 
+        # Build right-column sensor frames (rows 0-1 inside right_panel)
         self._build_force_frame()
         self._build_touch_frame()
 
     def _build_connection_frame(self):
-        """Left panel row 0 — serial port settings and Connect/Disconnect button."""
+        """Left panel row 0 — serial port settings and the Connect/Disconnect button."""
         conn = ttk.LabelFrame(self.left_panel, text="Connection")
         conn.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
         conn.columnconfigure(1, weight=1)
@@ -141,7 +172,7 @@ class StageControlGUI:
         self.connect_button.grid(row=0, column=4, sticky="e", padx=4, pady=4)
 
     def _build_step_frame(self):
-        """Left panel row 1 — X/Y and Z step size entry boxes."""
+        """Left panel row 1 — entry boxes for X/Y and Z step sizes."""
         step = ttk.LabelFrame(self.left_panel, text="Step sizes (mm)")
         step.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
         step.columnconfigure(1, weight=1)
@@ -158,7 +189,16 @@ class StageControlGUI:
         self.z_step_entry.grid(row=0, column=3, sticky="ew", padx=4, pady=4)
 
     def _build_speed_frame(self):
-        """Left panel row 2 — per-axis speed entries (mm/s) and Set Speed button."""
+        """Row 2 — per-axis speed entry boxes and a Set Speed button.
+
+        Speeds are entered in mm/s. The conversion to µs/step (required by the
+        firmware) is done automatically inside set_speed() using the motor's
+        physical constants (steps/mm and the firmware timing formula).
+
+        X and Y share the same lead screw pitch so their steps/mm are identical.
+        Z has a finer pitch and therefore a different steps/mm value — the same
+        mm/s value will result in a different µs/step number for Z.
+        """
         speed = ttk.LabelFrame(self.left_panel, text="Speed (mm/s)")
         speed.grid(row=2, column=0, sticky="ew", padx=2, pady=2)
         speed.columnconfigure(1, weight=1)
@@ -184,7 +224,11 @@ class StageControlGUI:
         self.set_speed_button.grid(row=0, column=6, sticky="e", padx=4, pady=4)
 
     def _build_control_frame(self):
-        """Left panel row 3 — +/- buttons for each axis and a Stop button."""
+        """Left panel row 3 — +/- buttons for each axis plus a Stop button.
+
+        Motors are enabled automatically before each move and disabled
+        immediately afterwards, so no manual Enable/Disable buttons are needed.
+        """
         control = ttk.LabelFrame(self.left_panel, text="Motion controls")
         control.grid(row=3, column=0, sticky="nsew", padx=2, pady=2)
         control.columnconfigure(0, weight=1)
@@ -200,7 +244,7 @@ class StageControlGUI:
         self.stop_button.grid(row=1, column=0, sticky="ew", padx=4, pady=6)
 
     def _add_axis_buttons(self, parent, axis_name, row):
-        """Add a label and +/- button pair for one axis to *parent*."""
+        """Add a label and +/- pair of buttons for one axis to *parent*."""
         ttk.Label(parent, text=f"{axis_name}:").grid(row=row, column=0, sticky="w", padx=4, pady=4)
 
         minus_btn = ttk.Button(
@@ -214,10 +258,13 @@ class StageControlGUI:
 
         minus_btn.grid(row=row, column=1, sticky="ew", padx=4, pady=4)
         plus_btn.grid( row=row, column=2, sticky="ew", padx=4, pady=4)
+
+        # Keep a flat list of all axis buttons so we can enable/disable them
+        # together without searching the widget tree.
         self._motion_buttons.extend([minus_btn, plus_btn])
 
     def _build_status_frame(self):
-        """Left panel row 4 — connection status and X/Y/Z position labels."""
+        """Left panel row 4 — connection status text and X/Y/Z position labels."""
         status = ttk.Frame(self.left_panel)
         status.grid(row=4, column=0, sticky="ew", padx=2, pady=2)
         status.columnconfigure(1, weight=1)
@@ -245,13 +292,13 @@ class StageControlGUI:
         self.z_pos_label.grid(row=0, column=5, sticky="w", padx=4, pady=2)
 
     def _build_force_frame(self):
-        """Right panel row 0 — force sensor connection, live line graph, and calibration."""
+        """Right panel row 0 — force-sensor connection, live line graph, and calibration."""
         force = ttk.LabelFrame(self.right_panel, text="Force Sensor")
         force.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
-        force.columnconfigure(1, weight=1)
-        force.rowconfigure(1, weight=1)
+        force.columnconfigure(1, weight=1)  # port entry expands
+        force.rowconfigure(1, weight=1)     # graph row expands
 
-        # Serial port controls
+        # --- Serial port controls ---
         ttk.Label(force, text="Port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.force_port_entry = ttk.Entry(force)
         self.force_port_entry.insert(0, DEFAULT_FORCE_PORT)
@@ -268,12 +315,13 @@ class StageControlGUI:
         self.force_calib_button = ttk.Button(force, text="Calibrate", command=self._force_calibrate)
         self.force_calib_button.grid(row=0, column=5, sticky="e", padx=4, pady=4)
 
+        # Y-axis max — user can type a new value; the plot picks it up on the next redraw
         ttk.Label(force, text="Y max (g):").grid(row=0, column=6, sticky="w", padx=(8, 2), pady=4)
         self.force_y_max_entry = ttk.Entry(force, width=6)
         self.force_y_max_entry.insert(0, str(DEFAULT_FORCE_Y_MAX))
         self.force_y_max_entry.grid(row=0, column=7, sticky="w", padx=(0, 4), pady=4)
 
-        # Matplotlib line graph
+        # --- Matplotlib line graph ---
         self.force_fig = Figure(figsize=(6, 2.5), dpi=100)
         self.force_ax  = self.force_fig.add_subplot(111)
         self.force_ax.set_title("Force (g)")
@@ -284,18 +332,29 @@ class StageControlGUI:
         self.force_canvas = FigureCanvasTkAgg(self.force_fig, master=force)
         self.force_canvas.get_tk_widget().grid(row=1, column=0, columnspan=8, sticky="nsew")
 
-        # Internal state
-        self._force_data        = deque()
-        self._force_lock        = threading.Lock()   # guards _force_data
-        self._force_serial_lock = threading.Lock()   # guards serial during calibration
-        self._force_serial      = None
-        self._force_thread      = None
-        self._force_running     = False
-        self._force_regex       = re.compile(r"<FORCE,\s*([+-]?\d*\.?\d+)>")
+        # --- Internal state for the force-sensor thread ---
+        # The reader thread runs in the background and fills _force_data.
+        # _force_lock protects _force_data from simultaneous access by the
+        # reader thread and the main (GUI) thread.
+        # _force_serial_lock gives the calibration commands exclusive use of
+        # the serial port so they don't race with the normal reader loop.
+        self._force_data       = deque()          # list of (timestamp, grams) tuples
+        self._force_lock       = threading.Lock() # guards _force_data
+        self._force_serial_lock = threading.Lock() # guards _force_serial during calibration
 
+        self._force_serial  = None   # serial.Serial object when connected
+        self._force_thread  = None   # background reader thread
+        self._force_running = False  # set to False to stop the reader thread
+
+        # Regex that matches the Arduino's <FORCE,123.45> output lines
+        self._force_regex = re.compile(r"<FORCE,\s*([+-]?\d*\.?\d+)>")
+
+        # Start the periodic graph redraw (runs even when no sensor is connected)
         self._schedule_force_plot()
 
-    # --- CONNECTION MANAGEMENT ---
+    # =========================================================================
+    # CONNECTION MANAGEMENT
+    # =========================================================================
 
     def _set_status(self, message, color="black"):
         """Update the status label text and colour."""
@@ -304,16 +363,25 @@ class StageControlGUI:
     def _update_connection_state(self, connected):
         """Enable or disable controls that require an active stage connection."""
         state = "normal" if connected else "disabled"
+
+        # Enable/disable the Stop and Set Speed buttons
         self.stop_button.config(state=state)
         self.set_speed_button.config(state=state)
+
+        # Enable/disable all six axis movement buttons
         for btn in self._motion_buttons:
             btn.config(state=state)
+
+        # Swap Connect ↔ Disconnect label and lock the port fields while connected
         self.connect_button.config(text="Disconnect" if connected else "Connect")
         self.port_entry.config(state="disabled" if connected else "normal")
         self.baud_entry.config(state="disabled" if connected else "normal")
 
     def connect(self):
-        """Toggle the serial connection to the stage Arduino."""
+        """Open the serial connection to the stage Arduino.
+
+        If already connected, this disconnects instead (the button toggles).
+        """
         if self.comms is not None and self.comms.is_open:
             self.disconnect()
             return
@@ -324,7 +392,7 @@ class StageControlGUI:
             return
 
         try:
-            baud = _parse_baud(self.baud_entry)
+            baud = int(self.baud_entry.get().strip())
         except ValueError:
             messagebox.showwarning("Invalid baud", "Baud rate must be a whole number.")
             return
@@ -333,6 +401,8 @@ class StageControlGUI:
             self.comms = StageCommandComms(port=port, baudrate=baud, timeout=1.0)
             self._update_connection_state(connected=True)
             self._set_status(f"Connected to {port}", color="green")
+            # Give the Arduino 500 ms to settle after the connection reset, then
+            # fetch and display the current position.
             self.root.after(500, self._update_positions)
             self._schedule_position_update()
         except Exception as exc:
@@ -351,22 +421,32 @@ class StageControlGUI:
         self.comms = None
         self._update_connection_state(connected=False)
         self._set_status("Disconnected", color="red")
-        self._update_positions()
+        self._update_positions()   # resets the position labels to "--"
 
+        # Stop the force sensor connection too, if it is running
         if self._force_running:
             try:
                 self._stop_force()
             except Exception:
                 pass
 
-    # --- STAGE MOTION ---
+    # =========================================================================
+    # STAGE MOTION
+    # =========================================================================
 
     def move_axis(self, axis, negative=False):
-        """Send a relative move for one axis; auto-enable motors before and disable after."""
+        """Send a relative move command for one axis.
+
+        Parameters
+        ----------
+        axis:     "X", "Y", or "Z"
+        negative: True to move in the negative direction
+        """
         if self.comms is None or not self.comms.is_open:
             messagebox.showwarning("Not connected", "Please connect to the Arduino before moving.")
             return
 
+        # Read the step size from the appropriate entry box
         raw = self.xy_step_entry.get().strip() if axis in {"X", "Y"} else self.z_step_entry.get().strip()
         try:
             step = float(raw)
@@ -386,6 +466,7 @@ class StageControlGUI:
             self.comms.move_relative(x, y, z)
             self.comms.disable()
             self._set_status(f"Moved  X={x:.3f}  Y={y:.3f}  Z={z:.3f}")
+            # Refresh positions shortly after — small delay lets the Arduino complete the move
             self.root.after(100, self._update_positions)
         except Exception as exc:
             self._set_status(f"Move failed: {exc}", color="red")
@@ -404,11 +485,21 @@ class StageControlGUI:
             messagebox.showerror("Stop failed", str(exc))
 
     def set_speed(self):
-        """Read X/Y/Z speeds (mm/s), convert to µs/step, and send to the Arduino."""
+        """Read the X/Y/Z speed entries (mm/s), convert to µs/step, and send to Arduino.
+
+        The conversion uses each axis's steps/mm derived from the motor's physical
+        constants (lead-screw pitch, steps/rev, microstepping) and the firmware's
+        timing formula:
+
+            speed_us = 500,000 / (mm_per_s × steps_per_mm)
+
+        X and Y use XY_STEPS_PER_MM; Z uses Z_STEPS_PER_MM.
+        """
         if self.comms is None or not self.comms.is_open:
             messagebox.showwarning("Not connected", "Please connect to the Arduino before setting speed.")
             return
 
+        # Map each axis to its entry widget and the correct steps/mm constant.
         axis_info = [
             ("X", self.x_speed_entry, XY_STEPS_PER_MM),
             ("Y", self.y_speed_entry, XY_STEPS_PER_MM),
@@ -431,6 +522,7 @@ class StageControlGUI:
             messagebox.showwarning("Invalid speed", "\n".join(errors))
             return
 
+        # Convert mm/s → µs/step for each axis
         us_per_step = {
             axis: mm_per_s_to_us_per_step(mm_per_s_values[axis], steps_per_mm)
             for axis, _, steps_per_mm in axis_info
@@ -448,16 +540,12 @@ class StageControlGUI:
             self._set_status(f"Set speed failed: {exc}", color="red")
             messagebox.showerror("Set speed failed", str(exc))
 
-    def _set_pos_labels(self, x, y, z):
-        """Set all three position labels to the given values (pass a string like '--' or 'ERR')."""
-        self.x_pos_label.config(text=x)
-        self.y_pos_label.config(text=y)
-        self.z_pos_label.config(text=z)
-
     def _update_positions(self):
         """Ask the stage for its current position and update the X/Y/Z labels."""
         if self.comms is None or not self.comms.is_open:
-            self._set_pos_labels("--", "--", "--")
+            self.x_pos_label.config(text="--")
+            self.y_pos_label.config(text="--")
+            self.z_pos_label.config(text="--")
             return
 
         try:
@@ -469,11 +557,17 @@ class StageControlGUI:
                 x = response.payload.get("x_mm", 0.0)
                 y = response.payload.get("y_mm", 0.0)
                 z = response.payload.get("z_mm", 0.0)
-                self._set_pos_labels(f"{x:.3f}", f"{y:.3f}", f"{z:.3f}")
+                self.x_pos_label.config(text=f"{x:.3f}")
+                self.y_pos_label.config(text=f"{y:.3f}")
+                self.z_pos_label.config(text=f"{z:.3f}")
             else:
-                self._set_pos_labels("??", "??", "??")
+                self.x_pos_label.config(text="??")
+                self.y_pos_label.config(text="??")
+                self.z_pos_label.config(text="??")
         except Exception as exc:
-            self._set_pos_labels("ERR", "ERR", "ERR")
+            self.x_pos_label.config(text="ERR")
+            self.y_pos_label.config(text="ERR")
+            self.z_pos_label.config(text="ERR")
             print(f"Position query failed: {exc}")
 
     def _schedule_position_update(self):
@@ -482,7 +576,9 @@ class StageControlGUI:
             self._update_positions()
             self.root.after(POSITION_UPDATE_MS, self._schedule_position_update)
 
-    # --- FORCE SENSOR ---
+    # =========================================================================
+    # FORCE SENSOR
+    # =========================================================================
 
     def toggle_force(self):
         """Connect to or disconnect from the force-sensor Arduino."""
@@ -499,7 +595,7 @@ class StageControlGUI:
 
         port = self.force_port_entry.get().strip()
         try:
-            baud = _parse_baud(self.force_baud_entry)
+            baud = int(self.force_baud_entry.get().strip())
         except ValueError:
             messagebox.showwarning("Invalid baud", "Baud rate must be a whole number.")
             return
@@ -514,6 +610,8 @@ class StageControlGUI:
         self.force_connect_button.config(text="Disconnect Force")
         self.force_calib_button.config(state="normal")
 
+        # Start the reader in a daemon thread so it exits automatically when
+        # the main window is closed.
         self._force_thread = threading.Thread(target=self._force_reader_loop, daemon=True)
         self._force_thread.start()
 
@@ -533,9 +631,17 @@ class StageControlGUI:
         self.force_calib_button.config(state="disabled")
 
     def _force_reader_loop(self):
-        """Background thread: read <FORCE,123.45> lines and append to _force_data."""
+        """Background thread: continuously read force values from the serial port.
+
+        Each line from the Arduino is expected to look like:  <FORCE,123.45>
+        Parsed values are stored in self._force_data as (timestamp, grams) tuples.
+        Old data outside the rolling window is discarded automatically.
+        """
         while self._force_running and self._force_serial is not None:
-            # Skip this cycle if calibration is holding the serial lock
+            # Try to get the serial lock briefly.
+            # If the calibration code is currently holding the lock we skip this
+            # read cycle rather than blocking — this keeps calibration commands
+            # from racing with streaming data reads.
             got_lock = self._force_serial_lock.acquire(timeout=0.1)
             if not got_lock:
                 time.sleep(0.01)
@@ -560,6 +666,7 @@ class StageControlGUI:
                     now = time.time()
                     with self._force_lock:
                         self._force_data.append((now, force_value))
+                        # Remove readings older than the display window
                         cutoff = now - FORCE_WINDOW_S
                         while self._force_data and self._force_data[0][0] < cutoff:
                             self._force_data.popleft()
@@ -567,10 +674,17 @@ class StageControlGUI:
                 self._force_serial_lock.release()
 
     def _schedule_force_plot(self):
-        """Redraw the live force graph on the GUI thread, then reschedule."""
+        """Redraw the live force graph, then schedule the next redraw.
+
+        This runs on the main (GUI) thread via Tkinter's after() mechanism.
+        It is safe to update Tkinter widgets from here.
+        """
+        # Grab a snapshot of the current data under the lock so the reader
+        # thread can keep writing without waiting for us to finish drawing.
         with self._force_lock:
             if self._force_data:
-                now    = time.time()
+                now = time.time()
+                # Convert absolute timestamps to seconds-ago (negative = past)
                 times  = [t - now for (t, _) in self._force_data]
                 values = [v       for (_, v) in self._force_data]
             else:
@@ -597,12 +711,22 @@ class StageControlGUI:
         except Exception:
             pass
 
+        # Schedule the next update
         self.root.after(FORCE_PLOT_MS, self._schedule_force_plot)
 
-    # --- FORCE SENSOR CALIBRATION ---
+    # =========================================================================
+    # FORCE SENSOR CALIBRATION
+    # =========================================================================
 
     def _send_force_command(self, cmd, wait_prefix=None, timeout=5.0):
-        """Send a text command to the force sensor and optionally wait for a matching reply.
+        """Send a text command to the force sensor and optionally wait for a reply.
+
+        Parameters
+        ----------
+        cmd:         Command string to send (e.g. "CALIBRATE")
+        wait_prefix: If given, block until a response starting with this prefix
+                     arrives (e.g. "STATUS,ZERO_DONE"). Returns None on timeout.
+        timeout:     Maximum seconds to wait for the response.
 
         Returns the raw response string, or None if not waiting / timed out.
         """
@@ -618,6 +742,8 @@ class StageControlGUI:
         if wait_prefix is None:
             return None
 
+        # Hold the serial lock so the reader thread does not consume the response
+        # we are waiting for.
         acquired = self._force_serial_lock.acquire(timeout=timeout)
         if not acquired:
             return None
@@ -636,13 +762,24 @@ class StageControlGUI:
             self._force_serial_lock.release()
 
     def _force_calibrate(self):
-        """Run a two-point (zero + known weight) calibration sequence."""
+        """Run a two-point calibration sequence for the force sensor.
+
+        Steps
+        -----
+        1. Tell the sensor to start calibration.
+        2. Ask the user to remove all load, then confirm zero.
+        3. Ask the user to place a known weight on the sensor.
+        4. Send the known weight to the sensor so it can compute the scale factor.
+        5. Optionally save the calibration to the sensor's EEPROM.
+        """
         if self._force_serial is None:
             messagebox.showwarning("Not connected", "Connect to the force sensor first.")
             return
 
+        # Step 1: Start calibration on the sensor
         self._send_force_command("CALIBRATE", wait_prefix="STATUS", timeout=2.0)
 
+        # Step 2: Zero the sensor with no load
         if not messagebox.askokcancel(
             "Calibration",
             "Remove all load from the sensor, then press OK to record the zero point.",
@@ -656,11 +793,14 @@ class StageControlGUI:
             messagebox.showerror("Calibration", "Zeroing failed or timed out.")
             return
 
+        # Step 3: Open a dialog so the user can place a weight and enter its value.
+        # We use a non-blocking (non-modal) window so the user can still move the
+        # stage while the dialog is open.
         dlg = tk.Toplevel(self.root)
         dlg.title("Calibration — Apply Weight")
         dlg.geometry("360x120")
         dlg.transient(self.root)
-        dlg.grab_release()
+        dlg.grab_release()   # allow the main window to stay interactive
 
         ttk.Label(
             dlg,
@@ -679,6 +819,7 @@ class StageControlGUI:
         entry_frame.columnconfigure(1, weight=1)
 
         def on_apply():
+            """Called when the user clicks Apply Weight."""
             try:
                 weight_g = float(weight_entry.get().strip())
             except ValueError:
@@ -687,6 +828,7 @@ class StageControlGUI:
 
             dlg.destroy()
 
+            # Step 4: Send the known weight so the sensor can compute its scale factor
             cal_resp = self._send_force_command(
                 f"SET_WEIGHT,{weight_g}",
                 wait_prefix="STATUS,CAL_COMPLETE",
@@ -696,8 +838,10 @@ class StageControlGUI:
                 messagebox.showerror("Calibration", "Calibration step failed or timed out.")
                 return
 
+            # Parse the offset and scale factor out of the response
             match = re.search(r"<STATUS,CAL_COMPLETE,\s*([+-]?\d+),\s*([0-9.+\-eE]+)>", cal_resp)
-            offset = scale_val = None
+            offset    = None
+            scale_val = None
             if match:
                 try:
                     offset    = int(match.group(1))
@@ -705,11 +849,12 @@ class StageControlGUI:
                 except ValueError:
                     pass
 
-            summary = (
-                f"Calibration complete.\nOffset = {offset},  Scale = {scale_val:.6f}"
-                if scale_val is not None else "Calibration complete."
-            )
+            if scale_val is not None:
+                summary = f"Calibration complete.\nOffset = {offset},  Scale = {scale_val:.6f}"
+            else:
+                summary = "Calibration complete."
 
+            # Step 5: Offer to save to EEPROM
             if messagebox.askyesno("Calibration", summary + "\n\nSave calibration to device EEPROM?"):
                 self._send_force_command("SAVE_CAL", wait_prefix="STATUS,CAL_SAVED", timeout=3.0)
                 messagebox.showinfo("Calibration", "Calibration saved to EEPROM.")
@@ -717,6 +862,7 @@ class StageControlGUI:
                 messagebox.showinfo("Calibration", "Calibration not saved.")
 
         def on_cancel():
+            """Called when the user clicks Cancel."""
             dlg.destroy()
             messagebox.showinfo("Calibration", "Calibration cancelled.")
 
@@ -725,20 +871,31 @@ class StageControlGUI:
         ttk.Button(btn_frame, text="Apply Weight", command=on_apply).pack(side="right", padx=6)
         ttk.Button(btn_frame, text="Cancel",       command=on_cancel).pack(side="right")
 
-    # --- TOUCH SENSOR ---
+    # =========================================================================
+    # TOUCH SENSOR
+    # =========================================================================
 
     def _build_touch_frame(self):
         """Right panel row 1 — touch sensor connection and live capacitance bar chart.
 
-        Sensor types: Trill Flex (space-separated ints) or Raspberry Pi Pico
-        (comma-separated floats; plots channels 2–5, i.e. indices 1–4).
+        Supports two sensor types, selectable via radio buttons:
+
+        Trill Flex (default)
+            Each line is space-separated zero-padded integers, one per channel.
+            Example: 0234 0412 0089 0731 ...
+            All channels are plotted.
+
+        Raspberry Pi Pico
+            Each line is comma-separated floats.
+            Example: 0.0, 1.23, 4.56, 7.89, 0.12, ...
+            Only the 2nd–5th values (indices 1–4) are plotted as 4 bars.
         """
         touch = ttk.LabelFrame(self.right_panel, text="Touch Sensor")
         touch.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
-        touch.columnconfigure(1, weight=1)
-        touch.rowconfigure(2, weight=1)
+        touch.columnconfigure(1, weight=1)  # port entry expands
+        touch.rowconfigure(2, weight=1)     # graph row expands
 
-        # Row 0: serial port controls
+        # --- Row 0: serial port controls ---
         ttk.Label(touch, text="Port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
         self.touch_port_entry = ttk.Entry(touch)
         self.touch_port_entry.insert(0, DEFAULT_TOUCH_PORT)
@@ -754,6 +911,7 @@ class StageControlGUI:
         )
         self.touch_connect_button.grid(row=0, column=4, sticky="e", padx=4, pady=4)
 
+        # Y-axis min/max — user can type new values; the plot picks them up on the next redraw
         ttk.Label(touch, text="Y min:").grid(row=0, column=5, sticky="w", padx=(8, 2), pady=4)
         self.touch_y_min_entry = ttk.Entry(touch, width=6)
         self.touch_y_min_entry.insert(0, str(DEFAULT_TOUCH_Y_MIN))
@@ -764,7 +922,9 @@ class StageControlGUI:
         self.touch_y_max_entry.insert(0, str(DEFAULT_TOUCH_Y_MAX))
         self.touch_y_max_entry.grid(row=0, column=8, sticky="w", padx=(0, 4), pady=4)
 
-        # Row 1: sensor type selector
+        # --- Row 1: sensor type selector ---
+        # This controls how incoming serial lines are parsed.
+        # Changing the type while disconnected takes effect on the next connection.
         self._touch_sensor_type = tk.StringVar(value="trill")
 
         type_frame = ttk.Frame(touch)
@@ -784,9 +944,10 @@ class StageControlGUI:
         )
         self.touch_radio_pico.pack(side="left", padx=4)
 
+        # Keep a list so we can lock/unlock both buttons together
         self._touch_type_radios = [self.touch_radio_trill, self.touch_radio_pico]
 
-        # Row 2: Matplotlib bar chart
+        # --- Row 2: Matplotlib bar chart ---
         self.touch_fig = Figure(figsize=(6, 2.5), dpi=100)
         self.touch_ax  = self.touch_fig.add_subplot(111)
         self.touch_ax.set_title("Touch Sensor — no data yet")
@@ -798,17 +959,18 @@ class StageControlGUI:
             row=2, column=0, columnspan=9, sticky="nsew"
         )
 
-        # Internal state
+        # --- Internal state ---
         self._touch_lock    = threading.Lock()
-        self._touch_values  = []
-        self._touch_serial  = None
-        self._touch_thread  = None
+        self._touch_values  = []    # most recent parsed values as a list of numbers
+        self._touch_serial  = None  # serial.Serial object when connected
+        self._touch_thread  = None  # background reader thread
         self._touch_running = False
 
+        # Start the periodic chart redraw (runs even before a sensor is connected)
         self._schedule_touch_plot()
 
     def toggle_touch(self):
-        """Connect to or disconnect from the touch sensor."""
+        """Connect to or disconnect from the Trill touch sensor Arduino."""
         if self._touch_running:
             self._stop_touch()
         else:
@@ -822,7 +984,7 @@ class StageControlGUI:
 
         port = self.touch_port_entry.get().strip()
         try:
-            baud = _parse_baud(self.touch_baud_entry)
+            baud = int(self.touch_baud_entry.get().strip())
         except ValueError:
             messagebox.showwarning("Invalid baud", "Baud rate must be a whole number.")
             return
@@ -844,7 +1006,7 @@ class StageControlGUI:
         self._touch_thread.start()
 
     def _stop_touch(self):
-        """Stop the background reader thread and close the touch serial port."""
+        """Stop the background reader thread and close the touch sensor serial port."""
         self._touch_running = False
         if self._touch_thread is not None:
             self._touch_thread.join(timeout=1.0)
@@ -862,11 +1024,23 @@ class StageControlGUI:
             radio.config(state="normal")
 
     def _touch_reader_loop(self):
-        """Background thread: parse lines from the touch sensor and update _touch_values.
+        """Background thread: read and parse lines from the touch sensor serial port.
 
-        Trill Flex: space-separated zero-padded ints, all channels stored.
-        Pico: comma-separated floats; only channels 2-5 (indices 1-4) stored.
+        Parsing depends on the sensor type selected at connection time:
+
+        Trill Flex
+            Lines are space-separated zero-padded integers.
+            Example:  0234 0412 0089 0731 ...
+            All values are stored.
+
+        Raspberry Pi Pico
+            Lines are comma-separated floats.
+            Example:  0.0, 1.23, 4.56, 7.89, 0.12, ...
+            Only the 2nd–5th values (indices 1–4) are stored as 4 floats.
+            Lines with fewer than 5 fields are skipped.
         """
+        # Snapshot the selected type once at thread start so it stays consistent
+        # for the duration of this connection.
         sensor_type = self._touch_sensor_type.get()
 
         while self._touch_running and self._touch_serial is not None:
@@ -879,32 +1053,37 @@ class StageControlGUI:
                 continue
 
             if sensor_type == "trill":
+                # Space-separated zero-padded integers, one per channel
                 try:
                     values = [int(token) for token in line.split()]
                 except ValueError:
                     continue
 
             else:  # "pico"
-                # Each field may have trailing non-numeric tokens (e.g. "36.50  a98");
-                # take only the first token per field so float() doesn't raise.
+                # Comma-separated fields; each field may have trailing whitespace-
+                # separated tokens (e.g. "36.50  a98") — take only the first token
+                # of each field so those extras don't break float parsing.
                 try:
                     fields = [float(f.strip().split()[0]) for f in line.split(",")]
                 except (ValueError, IndexError):
                     continue
                 if len(fields) < 5:
-                    continue
-                values = [-f for f in fields[1:5]]
+                    continue  # not enough fields — skip this line
+                values = [-f for f in fields[1:5]]  # flip sign so touch is positive.
 
             if values:
                 with self._touch_lock:
                     self._touch_values = values
 
     def _schedule_touch_plot(self):
-        """Redraw the touch bar chart on the GUI thread, then reschedule."""
-        with self._touch_lock:
-            values = list(self._touch_values)
+        """Redraw the touch bar chart with the latest channel values, then reschedule.
 
-        self.touch_ax.cla()
+        This runs on the main (GUI) thread so it is safe to update Tkinter widgets.
+        """
+        with self._touch_lock:
+            values = list(self._touch_values)  # snapshot so we release the lock quickly
+
+        self.touch_ax.cla()  # clear previous bars
 
         try:
             y_min = float(self.touch_y_min_entry.get().strip())

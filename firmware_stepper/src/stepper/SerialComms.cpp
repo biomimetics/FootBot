@@ -79,6 +79,20 @@ void SerialComms::sendPositionFeedback(float xMm, float yMm, float zMm) {
   _serial->println(">");
 }
 
+void SerialComms::sendEncoderFeedback(char axis, float measuredMm, long counts, float commandedMm) {
+  _serial->print("<ENCODER,");
+  _serial->print(axis);
+  _serial->print(",");
+  _serial->print(measuredMm, 4);
+  _serial->print(",");
+  _serial->print(counts);
+  _serial->print(",");
+  _serial->print(commandedMm, 4);
+  _serial->print(",");
+  _serial->print(measuredMm - commandedMm, 4);
+  _serial->println(">");
+}
+
 void SerialComms::sendStatus(const char* message) {
   _serial->print("<STATUS,");
   _serial->print(message);
@@ -150,6 +164,11 @@ bool SerialComms::parseLine(const char* line, Command& command) {
     case COMMAND_ENABLE:
     case COMMAND_DISABLE:
     case COMMAND_QUERY_POSITION:
+    case COMMAND_QUERY_ENCODER:
+    case COMMAND_ZERO_ENCODER:
+      // Commands that take no arguments. Anything missing from this list is
+      // rejected as invalid by the default branch, even if parseCommandType
+      // recognized the keyword.
       parseOk = true;
       break;
     default:
@@ -200,6 +219,13 @@ SerialComms::CommandType SerialComms::parseCommandType(const char* token) {
   }
   if (strcmp(normalized, "QUERY_POS") == 0 || strcmp(normalized, "GET_POS") == 0 || strcmp(normalized, "POSITION?") == 0 || strcmp(normalized, "REPORT_POS") == 0) {
     return COMMAND_QUERY_POSITION;
+  }
+
+  if (strcmp(normalized, "QUERY_ENC") == 0 || strcmp(normalized, "GET_ENC") == 0 || strcmp(normalized, "ENCODER?") == 0) {
+    return COMMAND_QUERY_ENCODER;
+  }
+  if (strcmp(normalized, "ZERO_ENC") == 0 || strcmp(normalized, "RESET_ENC") == 0) {
+    return COMMAND_ZERO_ENCODER;
   }
 
   return COMMAND_INVALID;

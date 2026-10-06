@@ -18,6 +18,7 @@ except ImportError as exc:
 
 class StageCommandComms:
     RESPONSE_POSITION = "POSITION"
+    RESPONSE_ENCODER = "ENCODER"
     RESPONSE_STATUS = "STATUS"
     RESPONSE_ERROR = "ERROR"
     RESPONSE_UNKNOWN = "UNKNOWN"
@@ -117,6 +118,15 @@ class StageCommandComms:
         """Request the current stage position from the Arduino."""
         self._send_line("QUERY_POS")
 
+    def query_encoder(self):
+        """Request encoder readings. The Arduino answers with one ENCODER line
+        per fitted axis, or a STATUS,NO_ENCODERS line if none are enabled."""
+        self._send_line("QUERY_ENC")
+
+    def zero_encoder(self):
+        """Define the current physical location as zero for every fitted encoder."""
+        self._send_line("ZERO_ENC")
+
     def send_raw(self, raw_command):
         """Send a raw command string to the Arduino."""
         self._send_line(raw_command)
@@ -176,6 +186,22 @@ class StageCommandComms:
             except ValueError:
                 return self.Response(self.RESPONSE_ERROR, {"message": raw_line}, raw_line)
 
+        if tag == self.RESPONSE_ENCODER and len(parts) == 6:
+            try:
+                return self.Response(
+                    self.RESPONSE_ENCODER,
+                    {
+                        "axis": parts[1].upper(),
+                        "measured_mm": float(parts[2]),
+                        "counts": int(parts[3]),
+                        "commanded_mm": float(parts[4]),
+                        "error_mm": float(parts[5]),
+                    },
+                    raw_line,
+                )
+            except ValueError:
+                return self.Response(self.RESPONSE_ERROR, {"message": raw_line}, raw_line)
+
         if tag == self.RESPONSE_STATUS:
             return self.Response(self.RESPONSE_STATUS, {"message": ",".join(parts[1:])}, raw_line)
 
@@ -200,6 +226,8 @@ def _build_parser():
     group.add_argument("--enable", action="store_true", help="Send enable command")
     group.add_argument("--disable", action="store_true", help="Send disable command")
     group.add_argument("--query-pos", action="store_true", help="Request current position")
+    group.add_argument("--query-enc", action="store_true", help="Request measured encoder readings for all fitted axes")
+    group.add_argument("--zero-enc", action="store_true", help="Zero every fitted encoder at the current location")
     group.add_argument("--raw", type=str, help="Send a raw command string (comma or space separated)")
     group.add_argument("--interactive", action="store_true", help="Enter interactive command mode")
 
@@ -299,6 +327,10 @@ def main():
         comms.disable()
     elif args.query_pos:
         comms.query_position()
+    elif args.query_enc:
+        comms.query_encoder()
+    elif args.zero_enc:
+        comms.zero_encoder()
     elif args.raw:
         comms.send_raw(args.raw)
     else:

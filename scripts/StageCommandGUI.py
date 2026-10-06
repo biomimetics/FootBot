@@ -58,6 +58,9 @@ DEFAULT_TOUCH_Y_MAX   = 400             # default upper Y limit on the touch bar
 FORCE_WINDOW_S     = 10.0    # how many seconds of force history to show in the graph
 FORCE_PLOT_MS      = 250     # how often to redraw the force graph (milliseconds)
 POSITION_UPDATE_MS = 2000    # how often to poll the stage position (milliseconds)
+# Commanded vs measured positions always differ slightly (quadrature resolution,
+# backlash). Highlight the measured value only once the gap exceeds this.
+ENCODER_DRIFT_WARN_MM = 0.05
 
 TOUCH_PLOT_MS = 100          # how often to redraw the touch bar chart (milliseconds)
 
@@ -290,6 +293,19 @@ class StageControlGUI:
         ttk.Label(pos_frame, text="Z:").grid(row=0, column=4, sticky="w", padx=4, pady=2)
         self.z_pos_label = ttk.Label(pos_frame, text="--", foreground="blue")
         self.z_pos_label.grid(row=0, column=5, sticky="w", padx=4, pady=2)
+
+        # Measured encoder positions. The row above is the commanded step count;
+        # this one is what the encoders actually read. They diverge when steps
+        # are missed, the axis stalls, or the drivers are de-energized.
+        ttk.Label(pos_frame, text="Measured:").grid(row=1, column=0, sticky="w", padx=4, pady=2)
+        self.enc_labels = {}
+        for col, axis in enumerate(("X", "Y", "Z")):
+            label = ttk.Label(pos_frame, text="n/a", foreground="gray")
+            label.grid(row=1, column=1 + col * 2, sticky="w", padx=4, pady=2)
+            self.enc_labels[axis] = label
+
+        zero_btn = ttk.Button(pos_frame, text="Zero encoders", command=self.zero_encoders)
+        zero_btn.grid(row=2, column=0, columnspan=6, sticky="w", padx=4, pady=(2, 4))
 
     def _build_force_frame(self):
         """Right panel row 0 — force-sensor connection, live line graph, and calibration."""
@@ -569,6 +585,62 @@ class StageControlGUI:
             self.y_pos_label.config(text="ERR")
             self.z_pos_label.config(text="ERR")
             print(f"Position query failed: {exc}")
+
+        self._update_encoders()
+
+    def _update_encoders(self):
+        """Refresh the measured-position labels from any fitted encoders.
+
+        Axes without an encoder, and firmware predating encoder support, both
+        leave the labels showing "n/a" rather than reporting an error.
+        """
+        if self.comms is None or not self.comms.is_open:
+            for label in self.enc_labels.values():
+                label.config(text="n/a", foreground="gray")
+            return
+
+        try:
+            self.comms.query_encoder()
+            # One ENCODER line arrives per fitted axis, so keep reading until
+            # the board stops talking.
+            seen = set()
+            while True:
+                response = self.comms.read_response(timeout=0.2)
+                if response is None:
+                    break
+                if response.type != self.comms.RESPONSE_ENCODER:
+                    break
+                axis = response.payload.get("axis")
+                if axis not in self.enc_labels:
+                    continue
+                seen.add(axis)
+                measured = response.payload.get("measured_mm", 0.0)
+                error = response.payload.get("error_mm", 0.0)
+                # Flag a drift larger than the warning threshold so a missed
+                # step is visible without comparing the two rows by eye.
+                color = "red" if abs(error) > ENCODER_DRIFT_WARN_MM else "green"
+                self.enc_labels[axis].config(text=f"{measured:.3f}", foreground=color)
+
+            for axis, label in self.enc_labels.items():
+                if axis not in seen:
+                    label.config(text="n/a", foreground="gray")
+        except Exception as exc:
+            for label in self.enc_labels.values():
+                label.config(text="ERR", foreground="red")
+            print(f"Encoder query failed: {exc}")
+
+    def zero_encoders(self):
+        """Zero every fitted encoder at the current physical location."""
+        if self.comms is None or not self.comms.is_open:
+            messagebox.showwarning("Not connected", "Please connect before zeroing encoders.")
+            return
+        try:
+            self.comms.zero_encoder()
+            self.comms.wait_for_response(timeout=1.0)
+            self._set_status("Encoders zeroed")
+            self._update_encoders()
+        except Exception as exc:
+            self._set_status(f"Zero encoders failed: {exc}", color="red")
 
     def _schedule_position_update(self):
         """Re-schedule position polling as long as the stage is connected."""
@@ -1107,6 +1179,7 @@ class StageControlGUI:
         self.touch_ax.set_xlabel("Channel")
         self.touch_ax.set_ylabel("Raw value")
         self.touch_ax.set_ylim(y_min, y_max)
+        
 
         try:
             self.touch_canvas.draw_idle()

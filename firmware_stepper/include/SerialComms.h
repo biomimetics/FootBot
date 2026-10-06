@@ -14,6 +14,8 @@ class SerialComms {
       COMMAND_ENABLE,
       COMMAND_DISABLE,
       COMMAND_QUERY_POSITION,
+      COMMAND_QUERY_ENCODER,
+      COMMAND_ZERO_ENCODER,
       COMMAND_INVALID
     };
 
@@ -48,6 +50,11 @@ class SerialComms {
 
     // Send a formatted position response back to the host.
     void sendPositionFeedback(float xMm, float yMm, float zMm);
+
+    // Send one axis's measured encoder reading alongside its commanded
+    // position. Sent as a separate ENCODER line rather than extra POSITION
+    // fields so existing host-side parsers are unaffected.
+    void sendEncoderFeedback(char axis, float measuredMm, long counts, float commandedMm);
 
     // Send a short text status message back to the host.
     void sendStatus(const char* message);

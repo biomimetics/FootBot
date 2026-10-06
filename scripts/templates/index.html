@@ -255,6 +255,23 @@
           <span id="posZ">0.00</span> mm
         </div>
       </div>
+      <div class="status-grid">
+        <div class="status-card">
+          <strong>Measured X</strong>
+          <span id="encX">n/a</span>
+        </div>
+        <div class="status-card">
+          <strong>Measured Y</strong>
+          <span id="encY">n/a</span>
+        </div>
+        <div class="status-card">
+          <strong>Measured Z</strong>
+          <span id="encZ">n/a</span>
+        </div>
+        <div class="status-card">
+          <button id="zeroEncBtn" class="button-secondary">Zero encoders</button>
+        </div>
+      </div>
       <div>
         <h2>Console log</h2>
         <div class="log-box" id="log"></div>
@@ -413,6 +430,32 @@
     const posX = document.getElementById('posX');
     const posY = document.getElementById('posY');
     const posZ = document.getElementById('posZ');
+    const encLabels = {
+      X: document.getElementById('encX'),
+      Y: document.getElementById('encY'),
+      Z: document.getElementById('encZ'),
+    };
+
+    // Commanded and measured positions always differ a little (quadrature
+    // resolution, backlash). Only call it out past this threshold.
+    const ENCODER_DRIFT_WARN_MM = 0.05;
+
+    // Axes with no encoder fitted are simply absent from the payload.
+    function renderEncoders(encoders) {
+      const readings = encoders || {};
+      for (const axis of ['X', 'Y', 'Z']) {
+        const label = encLabels[axis];
+        const reading = readings[axis];
+        if (!reading || reading.measured_mm === null || reading.measured_mm === undefined) {
+          label.textContent = 'n/a';
+          label.style.color = '';
+          continue;
+        }
+        const error = reading.error_mm || 0;
+        label.textContent = `${reading.measured_mm.toFixed(3)} mm (err ${error.toFixed(3)})`;
+        label.style.color = Math.abs(error) > ENCODER_DRIFT_WARN_MM ? '#c0392b' : '#1e8449';
+      }
+    }
     const stageSize = document.getElementById('stageSize');
     const workspaceWidth = document.getElementById('workspaceWidth');
     const workspaceHeight = document.getElementById('workspaceHeight');
@@ -481,6 +524,7 @@
       posX.textContent = state.x_mm.toFixed(2);
       posY.textContent = state.y_mm.toFixed(2);
       posZ.textContent = state.z_mm.toFixed(2);
+      renderEncoders(data.encoders);
       stageSize.value = `${state.stage_size_in.toFixed(2)} in`;
       workspaceWidth.value = `${state.workspace_width_in.toFixed(2)} in`;
       workspaceHeight.value = `${state.workspace_height_in.toFixed(2)} in`;
@@ -497,6 +541,7 @@
           posX.textContent = state.x_mm.toFixed(2);
           posY.textContent = state.y_mm.toFixed(2);
           posZ.textContent = state.z_mm.toFixed(2);
+          renderEncoders(data.encoders);
           drawWorkspace();
           addLog(`Position refreshed: ${state.x_mm.toFixed(2)}, ${state.y_mm.toFixed(2)}, ${state.z_mm.toFixed(2)}`);
         }
@@ -624,6 +669,10 @@
 
     document.getElementById('enableBtn').addEventListener('click', async () => {
       await sendCommand('enable');
+    });
+
+    document.getElementById('zeroEncBtn').addEventListener('click', async () => {
+      await sendCommand('zero_enc');
     });
 
     document.getElementById('disableBtn').addEventListener('click', async () => {

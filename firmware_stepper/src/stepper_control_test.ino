@@ -2,7 +2,7 @@
 #include "MultiAxisStepper.h"
 #include "StageController.h"
 #include "SerialComms.h"
-//#include <Encoder.h>
+#include "AxisEncoder.h"
 
 #include "common_constants.h"
 
@@ -21,6 +21,11 @@ StageController stage_controller(multi_axis_stepper,
                                   MOTOR_Z_STEPS_PER_REV * MOTOR_Z_MICROSTEP},
                                  (float[AXIS_COUNT]){MOTOR_X_MM_PER_REV, MOTOR_Y_MM_PER_REV, MOTOR_Z_MM_PER_REV});
 
+// define the read-only encoders (measure actual travel). Which axes are
+// actually fitted is set by ENCODER_*_ENABLED in common_constants.h.
+AxisEncoder encoders[AXIS_COUNT];
+const char AXIS_NAMES[AXIS_COUNT] = { 'X', 'Y', 'Z' };
+
 // define serial communication object
 SerialComms serialComms(Serial);
 
@@ -32,6 +37,13 @@ void setup()
   stage_controller.setSpeeds(COMMON_SPEED, COMMON_SPEED, COMMON_SPEED);
 
   stage_controller.setPulseWidths(COMMON_PULSE_WIDTH, COMMON_PULSE_WIDTH, COMMON_PULSE_WIDTH);
+
+  encoders[0].begin(ENCODER_X_ENABLED, ENCODER_X_PIN_A, ENCODER_X_PIN_B,
+                    ENCODER_X_PPR, ENCODER_COUNTS_PER_PULSE, ENCODER_X_MM_PER_REV);
+  encoders[1].begin(ENCODER_Y_ENABLED, ENCODER_Y_PIN_A, ENCODER_Y_PIN_B,
+                    ENCODER_Y_PPR, ENCODER_COUNTS_PER_PULSE, ENCODER_Y_MM_PER_REV);
+  encoders[2].begin(ENCODER_Z_ENABLED, ENCODER_Z_PIN_A, ENCODER_Z_PIN_B,
+                    ENCODER_Z_PPR, ENCODER_COUNTS_PER_PULSE, ENCODER_Z_MM_PER_REV);
 
   serialComms.sendStatus("STARTING UP");
 }
@@ -72,6 +84,34 @@ void loop()
     case SerialComms::COMMAND_DISABLE:
       stage_controller.disable();
       serialComms.sendStatus("DISABLE");
+      break;
+
+    case SerialComms::COMMAND_QUERY_ENCODER: {
+      // One line per fitted axis. A board with no encoders answers with a
+      // status line rather than silence, so the host can tell them apart.
+      bool anyEnabled = false;
+      for (int i = 0; i < AXIS_COUNT; i++) {
+        if (!encoders[i].isEnabled()) {
+          continue;
+        }
+        anyEnabled = true;
+        serialComms.sendEncoderFeedback(
+          AXIS_NAMES[i],
+          encoders[i].getPositionMm(),
+          encoders[i].getCounts(),
+          stage_controller.getPositionMm(static_cast<MultiAxisStepper::Axis>(i)));
+      }
+      if (!anyEnabled) {
+        serialComms.sendStatus("NO_ENCODERS");
+      }
+      break;
+    }
+
+    case SerialComms::COMMAND_ZERO_ENCODER:
+      for (int i = 0; i < AXIS_COUNT; i++) {
+        encoders[i].zero();
+      }
+      serialComms.sendStatus("ZERO_ENC");
       break;
 
     case SerialComms::COMMAND_QUERY_POSITION:

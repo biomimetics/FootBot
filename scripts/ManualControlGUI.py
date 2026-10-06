@@ -30,6 +30,9 @@ state = {
     'x_mm': 0.0,
     'y_mm': 0.0,
     'z_mm': 0.0,
+    # Measured encoder positions per axis, keyed X/Y/Z. An axis with no encoder
+    # fitted stays absent, which the UI renders as "n/a".
+    'encoders': {},
     'stage_size_in': 7.0,
     'workspace_width_in': 5.5,
     'workspace_height_in': 5.5,
@@ -73,10 +76,37 @@ def _query_position():
         state['y_mm'] = payload['y_mm']
         state['z_mm'] = payload['z_mm']
         _log(f"Position: {state['x_mm']:.2f}, {state['y_mm']:.2f}, {state['z_mm']:.2f}")
+        _query_encoders()
         return True, 'Position updated'
     except Exception as exc:
         _log(f'Query failed: {exc}')
         return False, str(exc)
+
+
+def _query_encoders():
+    """Refresh measured encoder positions. Silent no-op without encoder support."""
+    if not state['connected']:
+        return
+
+    try:
+        controller.query_encoder()
+        readings = {}
+        # One ENCODER line arrives per fitted axis; read until the board stops.
+        while True:
+            response = controller.read_response(timeout=0.2)
+            if response is None or response.type != StageCommandComms.RESPONSE_ENCODER:
+                break
+            axis = response.payload.get('axis')
+            if axis:
+                readings[axis] = {
+                    'measured_mm': response.payload.get('measured_mm'),
+                    'commanded_mm': response.payload.get('commanded_mm'),
+                    'error_mm': response.payload.get('error_mm'),
+                }
+        state['encoders'] = readings
+    except Exception as exc:
+        state['encoders'] = {}
+        _log(f'Encoder query failed: {exc}')
 
 
 def _send_command(action, *args):
@@ -119,6 +149,7 @@ def api_status():
         x_mm=state['x_mm'],
         y_mm=state['y_mm'],
         z_mm=state['z_mm'],
+        encoders=state['encoders'],
         stage_size_in=state['stage_size_in'],
         workspace_width_in=state['workspace_width_in'],
         workspace_height_in=state['workspace_height_in'],
@@ -138,6 +169,7 @@ def api_position():
             'y_mm': state['y_mm'],
             'z_mm': state['z_mm'],
         },
+        encoders=state['encoders'],
     )
 
 
@@ -217,6 +249,10 @@ def api_command():
         success, message = _send_command(controller.disable)
     elif action == 'query_pos':
         success, message = _query_position()
+    elif action == 'zero_enc':
+        success, message = _send_command(controller.zero_encoder)
+        if success:
+            _query_encoders()
     else:
         return jsonify(success=False, message='Unknown action'), 400
 
@@ -232,6 +268,7 @@ def api_command():
             'y_mm': state['y_mm'],
             'z_mm': state['z_mm'],
         },
+        encoders=state['encoders'],
         status=state['status'],
     )
 
@@ -239,4 +276,4 @@ def api_command():
 if __name__ == '__main__':
     _refresh_ports()
     app.run(host='0.0.0.0', port=8080, threaded=True)
-TEST
+

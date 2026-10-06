@@ -3,6 +3,5 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
-scripts/collect_force_displacement.py
 force_disp.png
 force_disp.csv

@@ -12,7 +12,7 @@ except ImportError:
     print("pyserial is required. Install with: python3 -m pip install pyserial")
     sys.exit(1)
 
-PORT = "/dev/ttyACM1"
+PORT = "/dev/ttyACM2"
 BAUD = 115200
 POLL_INTERVAL = 0.5
 

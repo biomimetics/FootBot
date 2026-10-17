@@ -8,6 +8,7 @@ Provides a Tkinter desktop window that lets you:
   - Connect to a separate force-sensor Arduino and view a live force graph
   - Run a two-point force calibration sequence
   - Connect to a Trill flex touch-sensor Arduino and view a live bar chart
+  - Record stage movements and force readings to a timestamped CSV
 
 Hardware setup
 --------------
@@ -21,8 +22,10 @@ How to run
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
+import csv
+import os
 import threading
 import time
 import re
@@ -30,8 +33,10 @@ from collections import deque
 
 try:
     import serial
+    from serial.tools import list_ports
 except ImportError:
     serial = None  # force-sensor features will be disabled if pyserial is missing
+    list_ports = None
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -55,6 +60,63 @@ DEFAULT_FORCE_Y_MAX   = 1000            # default upper Y limit on the force gra
 DEFAULT_TOUCH_Y_MIN   = 0               # default lower Y limit on the touch bar chart (raw units)
 DEFAULT_TOUCH_Y_MAX   = 400             # default upper Y limit on the touch bar chart (raw units)
 
+# Boards identified by their USB serial number, which never changes for a given
+# board across replugs, reboots or machines. This is what makes the port
+# dropdowns stable when Linux renumbers /dev/ttyACM* - which it does routinely.
+#
+# To add a board: plug it in, run
+#     python -c "from serial.tools import list_ports; [print(p.device, p.serial_number, p.manufacturer, p.product) for p in list_ports.comports()]"
+# and paste its serial number here against the role it plays.
+KNOWN_BOARDS = {
+    # Confirmed: answers QUERY_POS with a POSITION line.
+    "75136323337351C07192": "stage",
+    # Second Mega, currently silent on open and unresponsive to GET_CAL /
+    # STREAM_ON / QUERY_POS. Role unconfirmed, so deliberately not mapped -
+    # it still appears in the dropdowns, just without a role label.
+    # "5563930313535111E1C1": "force",
+}
+
+# Fallback role guesses by USB vendor ID, used only when the serial number is
+# not in KNOWN_BOARDS above.
+VENDOR_HINTS = {
+    0x2341: "Arduino",       # Arduino SA
+    0x2A03: "Arduino Srl",
+    0x2E8A: "Raspberry Pi",  # Pico-based touch sensor
+}
+
+ROLE_LABELS = {"stage": "Stage", "force": "Force", "touch": "Touch"}
+
+
+def describe_ports():
+    """List candidate serial ports with a human-readable label for each.
+
+    Returns a list of (device, label, role) tuples, role being 'stage',
+    'force', 'touch' or None when the board is not recognised.
+    """
+    if list_ports is None:
+        return []
+
+    described = []
+    for port in sorted(list_ports.comports(), key=lambda p: p.device):
+        # Skip the motherboard's phantom /dev/ttyS* UARTs, which outnumber the
+        # real devices roughly 30 to 1 and are never what the user wants.
+        if "ACM" not in port.device and "USB" not in port.device:
+            continue
+
+        role = KNOWN_BOARDS.get(port.serial_number or "")
+        if role:
+            detail = ROLE_LABELS[role]
+        else:
+            detail = port.product or VENDOR_HINTS.get(port.vid or 0) or port.manufacturer or "unknown"
+        described.append((port.device, f"{port.device} - {detail}", role))
+    return described
+
+
+def port_from_label(text):
+    """Recover a device path from a dropdown label, or from hand-typed text."""
+    return (text or "").split(" - ")[0].strip()
+
+
 FORCE_WINDOW_S     = 10.0    # how many seconds of force history to show in the graph
 FORCE_PLOT_MS      = 250     # how often to redraw the force graph (milliseconds)
 POSITION_UPDATE_MS = 2000    # how often to poll the stage position (milliseconds)
@@ -63,6 +125,17 @@ POSITION_UPDATE_MS = 2000    # how often to poll the stage position (millisecond
 ENCODER_DRIFT_WARN_MM = 0.05
 
 TOUCH_PLOT_MS = 100          # how often to redraw the touch bar chart (milliseconds)
+
+# Polling the stage blocks the GUI thread briefly, so it only runs fast while
+# recording, where a denser position trace is worth the slight lag.
+RECORD_POSITION_UPDATE_MS = 500
+RECORD_STATUS_MS          = 500   # how often to flush the file and refresh the row count
+RECORD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+RECORD_FIELDS = [
+    "time_s", "unix_time", "event", "force_g",
+    "x_mm", "y_mm", "z_mm", "x_enc_mm", "y_enc_mm", "z_enc_mm",
+    "move_x_mm", "move_y_mm", "move_z_mm",
+]
 
 # ---------------------------------------------------------------------------
 # Motor physical constants — from firmware_stepper/include/common_constants.h
@@ -112,8 +185,21 @@ class StageControlGUI:
         # list of axis movement buttons — used to enable/disable them as a group
         self._motion_buttons = []
 
+        # Recording state. Rows arrive from both the force reader thread and the
+        # GUI thread, so the writer is guarded by _record_lock.
+        self._record_file   = None
+        self._record_writer = None
+        self._record_lock   = threading.Lock()
+        self._record_start  = 0.0
+        self._record_rows   = 0
+        # Last known positions, carried onto every row so force readings can be
+        # matched to where the stage was without a separate join.
+        self._last_pos = {"x_mm": None, "y_mm": None, "z_mm": None}
+        self._last_enc = {"x_enc_mm": None, "y_enc_mm": None, "z_enc_mm": None}
+
         self._build_widgets()
         self._update_connection_state(connected=False)
+        self.refresh_ports()
 
     # =========================================================================
     # GUI SETUP
@@ -150,6 +236,7 @@ class StageControlGUI:
         self._build_speed_frame()
         self._build_control_frame()
         self._build_status_frame()
+        self._build_record_frame()
 
         # Build right-column sensor frames (rows 0-1 inside right_panel)
         self._build_force_frame()
@@ -162,7 +249,8 @@ class StageControlGUI:
         conn.columnconfigure(1, weight=1)
 
         ttk.Label(conn, text="Port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
-        self.port_entry = ttk.Entry(conn)
+        # Editable combobox: pick a detected board, or type a path by hand.
+        self.port_entry = ttk.Combobox(conn)
         self.port_entry.insert(0, DEFAULT_STAGE_PORT)
         self.port_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
 
@@ -173,6 +261,9 @@ class StageControlGUI:
 
         self.connect_button = ttk.Button(conn, text="Connect", command=self.connect)
         self.connect_button.grid(row=0, column=4, sticky="e", padx=4, pady=4)
+
+        self.refresh_ports_button = ttk.Button(conn, text="Refresh ports", command=self.refresh_ports)
+        self.refresh_ports_button.grid(row=1, column=0, columnspan=5, sticky="ew", padx=4, pady=(0, 4))
 
     def _build_step_frame(self):
         """Left panel row 1 — entry boxes for X/Y and Z step sizes."""
@@ -307,6 +398,18 @@ class StageControlGUI:
         zero_btn = ttk.Button(pos_frame, text="Zero encoders", command=self.zero_encoders)
         zero_btn.grid(row=2, column=0, columnspan=6, sticky="w", padx=4, pady=(2, 4))
 
+    def _build_record_frame(self):
+        """Left panel row 5 — start/stop recording of stage and force data."""
+        record = ttk.LabelFrame(self.left_panel, text="Recording")
+        record.grid(row=5, column=0, sticky="ew", padx=2, pady=2)
+        record.columnconfigure(1, weight=1)
+
+        self.record_button = ttk.Button(record, text="Start Recording", command=self.toggle_recording)
+        self.record_button.grid(row=0, column=0, sticky="w", padx=4, pady=4)
+
+        self.record_label = ttk.Label(record, text="Not recording", foreground="gray")
+        self.record_label.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+
     def _build_force_frame(self):
         """Right panel row 0 — force-sensor connection, live line graph, and calibration."""
         force = ttk.LabelFrame(self.right_panel, text="Force Sensor")
@@ -316,7 +419,7 @@ class StageControlGUI:
 
         # --- Serial port controls ---
         ttk.Label(force, text="Port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
-        self.force_port_entry = ttk.Entry(force)
+        self.force_port_entry = ttk.Combobox(force)
         self.force_port_entry.insert(0, DEFAULT_FORCE_PORT)
         self.force_port_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
 
@@ -372,6 +475,49 @@ class StageControlGUI:
     # CONNECTION MANAGEMENT
     # =========================================================================
 
+    def refresh_ports(self):
+        """Rescan USB serial devices and repopulate all three port dropdowns.
+
+        Each dropdown preselects the board matching its role, but only while
+        that field still holds a value the user has not edited - a hand-typed
+        or already-correct path is never overwritten.
+        """
+        described = describe_ports()
+        labels = [label for _, label, _ in described]
+        by_role = {role: label for _, label, role in described if role}
+
+        widgets = (
+            (self.port_entry, "stage"),
+            (self.force_port_entry, "force"),
+            (self.touch_port_entry, "touch"),
+        )
+        devices = {dev: dev_role for dev, _, dev_role in described}
+        for widget, role in widgets:
+            widget["values"] = labels
+            current = port_from_label(widget.get())
+            preferred = by_role.get(role)
+
+            # A port identified as another role's board is always wrong here -
+            # the stale /dev/ttyACM* defaults routinely point at whichever
+            # board happened to enumerate first. Never leave one in place.
+            claimed_by_other = devices.get(current) not in (None, role)
+
+            if preferred and (claimed_by_other or current not in devices):
+                widget.set(preferred)
+            elif claimed_by_other:
+                # No known board for this role, but the current one definitely
+                # belongs to a different role. Clear it rather than guess.
+                widget.set("")
+
+        if not described:
+            self._set_status("No USB serial devices found", color="red")
+        else:
+            unknown = sum(1 for _, _, role in described if role is None)
+            message = f"Found {len(described)} port(s)"
+            if unknown:
+                message += f", {unknown} unidentified"
+            self._set_status(message)
+
     def _set_status(self, message, color="black"):
         """Update the status label text and colour."""
         self.status_label.config(text=message, foreground=color)
@@ -402,7 +548,7 @@ class StageControlGUI:
             self.disconnect()
             return
 
-        port = self.port_entry.get().strip()
+        port = port_from_label(self.port_entry.get())
         if not port:
             messagebox.showwarning("Missing port", "Please enter a serial port to connect.")
             return
@@ -481,6 +627,7 @@ class StageControlGUI:
             self.comms.enable()
             self.comms.move_relative(x, y, z)
             self.comms.disable()
+            self._record_event("move", move_x_mm=x, move_y_mm=y, move_z_mm=z)
             self._set_status(f"Moved  X={x:.3f}  Y={y:.3f}  Z={z:.3f}")
             # Refresh positions shortly after — small delay lets the Arduino complete the move
             self.root.after(100, self._update_positions)
@@ -495,6 +642,7 @@ class StageControlGUI:
             return
         try:
             self.comms.stop()
+            self._record_event("stop")
             self._set_status("Stop command sent")
         except Exception as exc:
             self._set_status(f"Stop failed: {exc}", color="red")
@@ -576,6 +724,7 @@ class StageControlGUI:
                 self.x_pos_label.config(text=f"{x:.3f}")
                 self.y_pos_label.config(text=f"{y:.3f}")
                 self.z_pos_label.config(text=f"{z:.3f}")
+                self._last_pos = {"x_mm": x, "y_mm": y, "z_mm": z}
             else:
                 self.x_pos_label.config(text="??")
                 self.y_pos_label.config(text="??")
@@ -587,6 +736,7 @@ class StageControlGUI:
             print(f"Position query failed: {exc}")
 
         self._update_encoders()
+        self._record_event("position")
 
     def _update_encoders(self):
         """Refresh the measured-position labels from any fitted encoders.
@@ -620,6 +770,7 @@ class StageControlGUI:
                 # step is visible without comparing the two rows by eye.
                 color = "red" if abs(error) > ENCODER_DRIFT_WARN_MM else "green"
                 self.enc_labels[axis].config(text=f"{measured:.3f}", foreground=color)
+                self._last_enc[f"{axis.lower()}_enc_mm"] = measured
 
             for axis, label in self.enc_labels.items():
                 if axis not in seen:
@@ -637,6 +788,7 @@ class StageControlGUI:
         try:
             self.comms.zero_encoder()
             self.comms.wait_for_response(timeout=1.0)
+            self._record_event("zero_encoders")
             self._set_status("Encoders zeroed")
             self._update_encoders()
         except Exception as exc:
@@ -646,7 +798,8 @@ class StageControlGUI:
         """Re-schedule position polling as long as the stage is connected."""
         if self.comms is not None and self.comms.is_open:
             self._update_positions()
-            self.root.after(POSITION_UPDATE_MS, self._schedule_position_update)
+            interval = RECORD_POSITION_UPDATE_MS if self._record_writer else POSITION_UPDATE_MS
+            self.root.after(interval, self._schedule_position_update)
 
     # =========================================================================
     # FORCE SENSOR
@@ -665,7 +818,7 @@ class StageControlGUI:
             messagebox.showerror("Missing dependency", "pyserial is required for force sensor support.")
             return
 
-        port = self.force_port_entry.get().strip()
+        port = port_from_label(self.force_port_entry.get())
         try:
             baud = int(self.force_baud_entry.get().strip())
         except ValueError:
@@ -742,6 +895,7 @@ class StageControlGUI:
                         cutoff = now - FORCE_WINDOW_S
                         while self._force_data and self._force_data[0][0] < cutoff:
                             self._force_data.popleft()
+                    self._record_event("force", force_g=force_value, now=now)
             finally:
                 self._force_serial_lock.release()
 
@@ -944,6 +1098,123 @@ class StageControlGUI:
         ttk.Button(btn_frame, text="Cancel",       command=on_cancel).pack(side="right")
 
     # =========================================================================
+    # RECORDING
+    # =========================================================================
+
+    def toggle_recording(self):
+        """Start or stop recording stage and force data to CSV."""
+        if self._record_writer is not None:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def start_recording(self):
+        """Ask for an output file and start streaming rows into it.
+
+        Rows are written as they arrive rather than buffered, so a crash or
+        unplugged board mid-run still leaves everything up to that point on disk.
+        """
+        os.makedirs(RECORD_DIR, exist_ok=True)
+        default_name = time.strftime("recording_%Y%m%d_%H%M%S.csv")
+        path = filedialog.asksaveasfilename(
+            title="Save recording as",
+            initialdir=RECORD_DIR,
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*")],
+        )
+        if not path:
+            return
+
+        try:
+            f = open(path, "w", newline="")
+        except Exception as exc:
+            messagebox.showerror("Recording failed", str(exc))
+            return
+
+        writer = csv.DictWriter(f, fieldnames=RECORD_FIELDS)
+        writer.writeheader()
+        with self._record_lock:
+            self._record_file   = f
+            self._record_start  = time.time()
+            self._record_rows   = 0
+            self._record_writer = writer
+
+        self._record_path = path
+        self.record_button.config(text="Stop Recording")
+        self._record_event("start")
+        # Grab a starting position straight away rather than waiting for the poll.
+        self._update_positions()
+        self._schedule_record_status()
+
+    def stop_recording(self):
+        """Close the recording file."""
+        if self._record_writer is None:
+            return
+        self._record_event("end")
+        with self._record_lock:
+            f = self._record_file
+            rows = self._record_rows
+            self._record_writer = None
+            self._record_file   = None
+        try:
+            f.close()
+        except Exception:
+            pass
+        self.record_button.config(text="Start Recording")
+        self.record_label.config(
+            text=f"Saved {rows} rows to {os.path.basename(self._record_path)}",
+            foreground="black",
+        )
+        self._set_status(f"Recording saved to {self._record_path}")
+
+    def _record_event(self, event, force_g=None, now=None, **move):
+        """Append one row to the recording, if one is running.
+
+        Safe to call from any thread. Every row carries the most recent
+        commanded and encoder positions alongside the event itself.
+        """
+        if self._record_writer is None:
+            return
+        if now is None:
+            now = time.time()
+        with self._record_lock:
+            if self._record_writer is None:  # stopped while we waited for the lock
+                return
+            row = {
+                "time_s":    f"{now - self._record_start:.4f}",
+                "unix_time": f"{now:.4f}",
+                "event":     event,
+                "force_g":   force_g,
+                **self._last_pos,
+                **self._last_enc,
+                **move,
+            }
+            self._record_writer.writerow(row)
+            self._record_rows += 1
+
+    def _schedule_record_status(self):
+        """Flush the file and refresh the row counter while recording."""
+        if self._record_writer is None:
+            return
+        with self._record_lock:
+            rows = self._record_rows
+            try:
+                self._record_file.flush()
+            except Exception:
+                pass
+        elapsed = time.time() - self._record_start
+        self.record_label.config(
+            text=f"Recording  {elapsed:.0f} s, {rows} rows", foreground="red"
+        )
+        self.root.after(RECORD_STATUS_MS, self._schedule_record_status)
+
+    def on_close(self):
+        """Close the recording cleanly before the window goes away."""
+        self.stop_recording()
+        self.root.destroy()
+
+    # =========================================================================
     # TOUCH SENSOR
     # =========================================================================
 
@@ -969,7 +1240,7 @@ class StageControlGUI:
 
         # --- Row 0: serial port controls ---
         ttk.Label(touch, text="Port:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
-        self.touch_port_entry = ttk.Entry(touch)
+        self.touch_port_entry = ttk.Combobox(touch)
         self.touch_port_entry.insert(0, DEFAULT_TOUCH_PORT)
         self.touch_port_entry.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
 
@@ -1054,7 +1325,7 @@ class StageControlGUI:
             messagebox.showerror("Missing dependency", "pyserial is required for touch sensor support.")
             return
 
-        port = self.touch_port_entry.get().strip()
+        port = port_from_label(self.touch_port_entry.get())
         try:
             baud = int(self.touch_baud_entry.get().strip())
         except ValueError:
@@ -1195,7 +1466,8 @@ class StageControlGUI:
 
 def main():
     root = tk.Tk()
-    StageControlGUI(root)
+    app = StageControlGUI(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
 
 
